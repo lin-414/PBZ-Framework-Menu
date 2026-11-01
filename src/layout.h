@@ -11,6 +11,8 @@ constexpr float kPanelY = 80.0f;
 constexpr float kPanelW = 660.0f;   // panel size (fixed, sidebar + content)
 constexpr float kPanelH = 480.0f;
 constexpr float kSidebarW = 190.0f;
+constexpr float kPanelMinW = 420.0f;  // resize floor: sidebar + minimal readable content
+constexpr float kPanelMinH = 320.0f;  // title/tab bar + a usable content column
 
 // Click targets relative to the game-window client top-left. Based on style:
 // title 30, WindowPadding.y 10, sidebar item height ~30, tab bar ~30.

@@ -13,6 +13,7 @@
 #include "theme.h"
 
 #include <imgui.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <set>
@@ -73,14 +74,6 @@ bool SubtreeMatchesFilter(const Section& n, const char* needle) {
     return false;
 }
 
-// Mark every ancestor of the node expanded (a newly auto-selected leaf must
-// not hide inside a collapsed branch).
-void ExpandAncestors(std::set<std::string>& expanded, const Section& n) {
-    for (const Section* p = n.parent; p; p = p->parent) {
-        expanded.insert(RegistryPathOf(p));
-    }
-}
-
 struct TreeCtx {
     I18n* i18n;
     const char* search;                 // "" = no filter
@@ -92,10 +85,10 @@ struct TreeCtx {
     int* visibleRoots = nullptr;
 };
 
-// One row = one Selectable, caret glyph embedded in the label. Click rules:
-//  - node without content (a pure group): toggle expand + select first leaf;
-//  - node with content: select it; clicking it again toggles its children;
-//  - page rows (a multi-page node's own pages) select (node, page).
+// One row = one Selectable, caret glyph embedded in the label. A click on an
+// expandable row ALWAYS toggles the branch (that is the collapse affordance -
+// there is no separate caret widget) and selects the row; a node without its
+// own content lands the selection on its first page when it expands.
 void RenderTreeNode(Section& node, int depth, TreeCtx& tc) {
     const bool filtering = tc.search[0] != 0;
     if (filtering && !SubtreeMatchesFilter(node, tc.search)) return;
@@ -117,28 +110,20 @@ void RenderTreeNode(Section& node, int depth, TreeCtx& tc) {
     if (sel) ImGui::PushStyleColor(ImGuiCol_Text, theme::kGoldBright);
     if (ImGui::Selectable(label, sel)) {
         *tc.selSettings = false;
-        if (!node.pages.empty()) {
-            // Select the node's content; clicking an already-selected parent
-            // toggles its children (there is no separate caret widget).
-            const bool wasSelected = sel;
-            *tc.selPath = path;
-            *tc.selPage = 0;
-            if (expandable) {
-                if (wasSelected) {
-                    if (open) tc.expanded->erase(path);
-                    else tc.expanded->insert(path);
-                } else if (!open) {
-                    tc.expanded->insert(path);
-                }
-            }
-        } else if (!node.children.empty()) {
+        if (expandable) {
             if (open) tc.expanded->erase(path);
             else tc.expanded->insert(path);
+        }
+        if (!node.pages.empty()) {
+            *tc.selPath = path;
+            *tc.selPage = 0;
+        } else if (!node.children.empty() && !open) {
+            // a pure group just expanded: land the selection on its first page;
+            // collapsing leaves the current selection (and content) alone
             int idx = 0;
             if (const Section* f = FirstContentNode(node, &idx)) {
                 *tc.selPath = RegistryPathOf(f);
                 *tc.selPage = idx;
-                ExpandAncestors(*tc.expanded, *f);
             }
         }
     }
@@ -309,6 +294,15 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
     ImGui::SetNextWindowPos(ImVec2(layout::kPanelX, layout::kPanelY), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(layout::kPanelW, layout::kPanelH), ImGuiCond_FirstUseEver);
 
+    // Resize limits: the floor keeps sidebar + content readable at any ui scale;
+    // the ceiling is the game window itself, so the menu can at most fill the
+    // overlay it lives in. Begin() clamps SizeFull through these constraints, so
+    // the FirstUseEver size is covered too on game windows smaller than 660x480.
+    const ImVec2 disp = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowSizeConstraints(
+        ImVec2(layout::kPanelMinW, layout::kPanelMinH),
+        ImVec2(std::max(layout::kPanelMinW, disp.x), std::max(layout::kPanelMinH, disp.y)));
+
     ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::WithAlpha(theme::kPanel, cfg.uiOpacity));
     ImGui::PushStyleColor(ImGuiCol_TitleBg, theme::WithAlpha(theme::kInk, cfg.uiOpacity));
     ImGui::PushStyleColor(ImGuiCol_TitleBgActive, theme::WithAlpha(ImVec4(0.078f, 0.071f, 0.059f, 1.0f), cfg.uiOpacity));
@@ -406,7 +400,10 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
     }
 
     // First frame (or a vanished selection): open on the first mod content,
-    // straight onto settings when none has registered yet.
+    // straight onto settings when none has registered yet. The tree itself
+    // starts fully COLLAPSED - the selected row may sit inside a collapsed
+    // branch (its content still shows, like an editor opening a file while
+    // the explorer stays folded).
     if (!selSettings && (selPath.empty() || !RegistryFindPath(selPath.c_str()))) {
         selPath.clear();
         selPage = 0;
@@ -416,7 +413,6 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
             if (const Section* f = FirstContentNode(*r, &idx)) {
                 selPath = RegistryPathOf(f);
                 selPage = idx;
-                ExpandAncestors(expanded, *f);
                 break;
             }
         }
