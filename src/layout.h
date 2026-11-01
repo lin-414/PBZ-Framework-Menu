@@ -1,0 +1,23 @@
+// Panel layout constants shared between the in-game menu (menu.cpp, ImGui
+// units) and the test host. The host clicks the demo mod's section/tab/checkbox
+// at these predictable positions; the demo button itself is queried at runtime
+// through the demo mod's PBZFMDEMO_GetButton export.
+#pragma once
+
+namespace pbzfm { namespace layout {
+
+constexpr float kPanelX = 100.0f;   // panel top-left, overlay client coords
+constexpr float kPanelY = 80.0f;
+constexpr float kPanelW = 660.0f;   // panel size (fixed, sidebar + content)
+constexpr float kPanelH = 480.0f;
+constexpr float kSidebarW = 190.0f;
+
+// Click targets relative to the game-window client top-left. Based on style:
+// title 30, WindowPadding.y 10, sidebar item height ~30, tab bar ~30.
+// Fine-tuned against the first host screenshot of the new layout.
+constexpr float kDemoSectionCy = 165.0f;  // second sidebar entry (demo mod)
+constexpr float kFirstBoolCy   = 181.0f;  // first schema item (checkbox) center
+constexpr float kTab2Cx        = 402.0f;  // second page tab center x
+constexpr float kTabCy         = 145.0f;  // page tab row center y
+
+} } // namespace pbzfm::layout

@@ -1,0 +1,14 @@
+# build artifacts
+build/
+dist/
+
+# runtime state
+*.log
+host_run.txt
+demo_mod_state.txt
+demo_mod_change.log
+data/
+
+# editor junk
+.vs/
+.vscode/
