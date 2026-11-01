@@ -281,11 +281,11 @@ void RenderSchemaForm(ConfigDef& cfg, const I18n& i18n, float dt) {
     for (auto& it : cfg.items) {
         switch (it.type) {
             case SCH_GROUP:
-                ImGui::SeparatorText(it.label.c_str());
+                ImGui::SeparatorText(i18n.T(it.label.c_str()));
                 break;
             case SCH_BOOL: {
                 bool b = it.ival != 0;
-                if (ImGui::Checkbox(it.label.c_str(), &b)) {
+                if (ImGui::Checkbox(i18n.T(it.label.c_str()), &b)) {
                     it.ival = b ? 1 : 0;
                     cfg.dirty = true;
                     cfg.FireChange(it.key.c_str());
@@ -294,7 +294,7 @@ void RenderSchemaForm(ConfigDef& cfg, const I18n& i18n, float dt) {
             }
             case SCH_INT: {
                 int v = (int)it.ival;
-                if (ImGui::SliderInt(it.label.c_str(), &v, (int)it.mn, (int)it.mx)) {
+                if (ImGui::SliderInt(i18n.T(it.label.c_str()), &v, (int)it.mn, (int)it.mx)) {
                     it.ival = v;
                     cfg.dirty = true;
                 }
@@ -303,7 +303,7 @@ void RenderSchemaForm(ConfigDef& cfg, const I18n& i18n, float dt) {
             }
             case SCH_FLOAT: {
                 float v = it.fval;
-                if (ImGui::SliderFloat(it.label.c_str(), &v, it.mn, it.mx, it.fmt.c_str())) {
+                if (ImGui::SliderFloat(i18n.T(it.label.c_str()), &v, it.mn, it.mx, it.fmt.c_str())) {
                     it.fval = v;
                     cfg.dirty = true;
                 }
@@ -314,7 +314,7 @@ void RenderSchemaForm(ConfigDef& cfg, const I18n& i18n, float dt) {
                 int v = (int)it.ival;
                 std::vector<const char*> opts;
                 for (auto& o : it.options) opts.push_back(o.c_str());
-                if (ImGui::Combo(it.label.c_str(), &v, opts.data(), (int)opts.size())) {
+                if (ImGui::Combo(i18n.T(it.label.c_str()), &v, opts.data(), (int)opts.size())) {
                     it.ival = v;
                     cfg.dirty = true;
                     cfg.FireChange(it.key.c_str());
@@ -322,7 +322,7 @@ void RenderSchemaForm(ConfigDef& cfg, const I18n& i18n, float dt) {
                 break;
             }
             case SCH_KEY: {
-                ImGui::TextUnformatted(it.label.c_str());
+                ImGui::TextUnformatted(i18n.T(it.label.c_str()));
                 ImGui::SameLine(0.0f, 12.0f);
                 char kb[64];
                 snprintf(kb, sizeof(kb), "[%s]", Config::VkName((unsigned)it.ival));

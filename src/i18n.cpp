@@ -61,6 +61,62 @@ R"json({
   "saved": "Saved to PBZFM.ini"
 })json";
 
+static const char* kJsonJp =
+R"json({
+  "title": "PBZ-Framework Menu",
+  "framework_section": "PBZ-Framework Menu",
+  "page_settings": "設定",
+  "hint": "独立した DirectComposition オーバーレイ",
+  "btn_test": "テストボタン",
+  "count": "クリック数",
+  "sec_display": "表示",
+  "sec_demo": "デモ設定",
+  "sec_keys": "キー設定",
+  "language": "言語",
+  "ui_scale": "UI スケール",
+  "ui_opacity": "不透明度",
+  "fov": "視野角 (FOV)",
+  "freeze": "時間停止",
+  "quality": "画質プリセット",
+  "q_low": "低",
+  "q_medium": "中",
+  "q_high": "高",
+  "q_custom": "カスタム",
+  "toggle_key": "メニュー開閉",
+  "capturing": "新しいキーを押してください…",
+  "save": "設定を保存",
+  "close_menu": "メニューを閉じる (Esc)",
+  "saved": "PBZFM.ini に保存しました"
+})json";
+
+static const char* kJsonKr =
+R"json({
+  "title": "PBZ-Framework Menu",
+  "framework_section": "PBZ-Framework Menu",
+  "page_settings": "설정",
+  "hint": "독립 실행형 DirectComposition 오버레이",
+  "btn_test": "테스트 버튼",
+  "count": "클릭 수",
+  "sec_display": "디스플레이",
+  "sec_demo": "데모 설정",
+  "sec_keys": "키 설정",
+  "language": "언어",
+  "ui_scale": "UI 배율",
+  "ui_opacity": "불투명도",
+  "fov": "시야각 (FOV)",
+  "freeze": "시간 정지",
+  "quality": "화질 프리셋",
+  "q_low": "낮음",
+  "q_medium": "보통",
+  "q_high": "높음",
+  "q_custom": "사용자 지정",
+  "toggle_key": "메뉴 열기/닫기",
+  "capturing": "새 키를 누르세요...",
+  "save": "설정 저장",
+  "close_menu": "메뉴 닫기 (Esc)",
+  "saved": "PBZFM.ini에 저장했습니다"
+})json";
+
 static std::wstring Utf8ToWide(const std::string& u) {
     if (u.empty()) return {};
     int n = MultiByteToWideChar(CP_UTF8, 0, u.c_str(), (int)u.size(), nullptr, 0);
@@ -162,10 +218,18 @@ static bool LoadTable(const std::wstring& path, const char* embedded, std::map<s
     return !out.empty();
 }
 
+// Embedded copy per shipped language: the dropdown languages keep working
+// even without the languages dir; unknown languages fall back to zh-CN.
+static const char* EmbeddedTable(const std::string& lang) {
+    if (lang == "en-US") return kJsonEn;
+    if (lang == "ja-JP") return kJsonJp;
+    if (lang == "ko-KR") return kJsonKr;
+    return kJsonZh;
+}
+
 bool I18n::Resolve(const std::string& lang) {
-    const char* embedded = (lang == "en-US") ? kJsonEn : kJsonZh;
     std::map<std::string, std::string> table;
-    if (!LoadTable(languagesDir_ + L"\\" + Utf8ToWide(lang), embedded, table)) return false;
+    if (!LoadTable(languagesDir_ + L"\\" + Utf8ToWide(lang) + L".json", EmbeddedTable(lang), table)) return false;
     strings_.swap(table);
     current_ = lang;
     return true;
@@ -194,9 +258,11 @@ const char* I18n::T(const char* key) const {
     return key;
 }
 
+// Pure static by design (no i18n context needed) - keep in sync with the
+// embedded tables above and assets/languages/*.json.
 const char* const* I18n::KnownLanguages(int* count) {
-    static const char* const langs[] = { "zh-CN", "en-US" };
-    if (count) *count = 2;
+    static const char* const langs[] = { "zh-CN", "en-US", "ja-JP", "ko-KR" };
+    if (count) *count = 4;
     return langs;
 }
 

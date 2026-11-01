@@ -306,15 +306,29 @@ bool InitImGui() {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
     bool fontOk = false;
-    const char* fontCandidates[] = {
+    // Malgun Gothic is the only candidate with Hangul, but its hanja coverage
+    // is too poor to serve Chinese, so it leads the list only for a Korean UI;
+    // everything else leads with YaHei (kana + CJK ideographs covered).
+    static const char* const kFontsDefault[] = {
         "C:/Windows/Fonts/msyh.ttc",      // Microsoft YaHei (simplified Chinese UI font)
         "C:/Windows/Fonts/msyhbd.ttc",
+        "C:/Windows/Fonts/malgun.ttf",    // Malgun Gothic (Korean)
+        "C:/Windows/Fonts/malgunbd.ttf",
         "C:/Windows/Fonts/segoeui.ttf",
     };
-    for (const char* p : fontCandidates) {
-        if (io.Fonts->AddFontFromFileTTF(p, 18.0f)) {
+    static const char* const kFontsKorean[] = {
+        "C:/Windows/Fonts/malgun.ttf",
+        "C:/Windows/Fonts/malgunbd.ttf",
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/segoeui.ttf",
+    };
+    const bool koreanUi = g_ov.cfg && g_ov.cfg->language == "ko-KR";
+    const char* const* fonts = koreanUi ? kFontsKorean : kFontsDefault;
+    const int fontCount = koreanUi ? 4 : 5;
+    for (int i = 0; i < fontCount; ++i) {
+        if (io.Fonts->AddFontFromFileTTF(fonts[i], 18.0f)) {
             fontOk = true;
-            Log("[ov] font loaded: %s", p);
+            Log("[ov] font loaded: %s", fonts[i]);
             break;
         }
     }

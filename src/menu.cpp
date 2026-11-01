@@ -86,8 +86,10 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
     s_i18n = &i18n;
     s_ui = &ui;
 
-    ImGui::SetNextWindowPos(ImVec2(layout::kPanelX, layout::kPanelY), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(layout::kPanelW, layout::kPanelH), ImGuiCond_Always);
+    // FirstUseEver: the user's drag-move/resize persists for the session
+    // (ImGuiCond_Always snapped the window back every frame).
+    ImGui::SetNextWindowPos(ImVec2(layout::kPanelX, layout::kPanelY), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(layout::kPanelW, layout::kPanelH), ImGuiCond_FirstUseEver);
 
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.08f, 0.08f, 0.11f, cfg.uiOpacity));
     ImGui::PushStyleColor(ImGuiCol_TitleBg, ImVec4(0.06f, 0.06f, 0.09f, cfg.uiOpacity));
@@ -106,10 +108,12 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
     auto& sections = RegistrySections();
 
     // Framework section always first; its settings page is a normal custom page.
-    Section* fw = RegistryGetOrCreateSection(i18n.T("framework_section"));
+    // Labels are stored as raw i18n keys: the render sites below run them
+    // through T(), so a language switch applies without re-registering.
+    Section* fw = RegistryGetOrCreateSection("framework_section");
     if (fw && fw->pages.empty()) {
         Page p;
-        p.label = i18n.T("page_settings");
+        p.label = "page_settings";
         p.fn = &FrameworkSettingsPage;
         RegistryAddPage(fw, p);
         s_frameworkRegistered = true;
@@ -124,7 +128,7 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
     ImGui::BeginChild("##sections", ImVec2(190.0f, -34.0f));
     RegistryResetSectionRects();
     for (int i = 0; i < (int)sections.size(); ++i) {
-        if (ImGui::Selectable(sections[i]->name.c_str(), selSection == i)) {
+        if (ImGui::Selectable(i18n.T(sections[i]->name.c_str()), selSection == i)) {
             selSection = i;
             selPage = 0;
         }
@@ -146,7 +150,7 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
         if (ImGui::BeginTabBar("##pages")) {
             for (int p = 0; p < (int)sec.pages.size(); ++p) {
                 Page& pg = sec.pages[p];
-                if (ImGui::BeginTabItem(pg.label.c_str())) {
+                if (ImGui::BeginTabItem(i18n.T(pg.label.c_str()))) {
                     selPage = p;
                     if (pg.schemaCfg) currentSchema = (ConfigDef*)pg.schemaCfg;
                     if (pg.fn) {

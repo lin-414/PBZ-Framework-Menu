@@ -10,7 +10,7 @@ namespace pbzfm {
 class I18n {
 public:
     bool Load(const std::wstring& languagesDir, const std::wstring& lang);
-    bool SetLanguage(const char* utf8Lang);              // "zh-CN" / "en-US"
+    bool SetLanguage(const char* utf8Lang);              // one of KnownLanguages()
     const char* T(const char* key) const;                // missing -> en-US -> key itself
     const char* Current() const { return current_.c_str(); }
 
