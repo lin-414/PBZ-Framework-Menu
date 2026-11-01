@@ -1,4 +1,4 @@
-PBZ-Framework Menu (0.2.0)
+PBZ-Framework Menu (0.3.2)
 =============================================
 
 《影之刃零》模组菜单框架的第一个可运行原型：
@@ -26,8 +26,7 @@ DirectComposition 独立覆盖窗 + ImGui，不钩游戏交换链（帧生成安
   （该目录不可写时回落到 ue4ss\Mods\PBZFM\PBZFM.log）。
 
 已知原型边界：
-  - 尚无模组注册 API（下一阶段：SetSection/AddSectionItem/设置 schema）
+  - 手柄导航未随包发布（功能已开发，暂时搁置；后续版本可能回归）
   - 尚未验证：真独占全屏、多显示器、HDR、Steam Overlay 等环境边角
-  - 手柄导航未接入
 
 卸载：删除 ue4ss\Mods\PBZFM 文件夹即可，游戏文件零改动。

@@ -28,6 +28,8 @@ R"json({
   "q_custom": "自定义",
   "toggle_key": "打开/关闭菜单",
   "capturing": "按下新按键…",
+  "screenshot": "截取屏幕",
+  "shot_saved": "已保存到 Screenshots 文件夹",
   "save": "保存配置",
   "close_menu": "关闭菜单 (Esc)",
   "saved": "已保存到 PBZFM.ini"
@@ -56,6 +58,8 @@ R"json({
   "q_custom": "Custom",
   "toggle_key": "Toggle menu",
   "capturing": "Press a new key...",
+  "screenshot": "Capture screen",
+  "shot_saved": "Saved to the Screenshots folder",
   "save": "Save settings",
   "close_menu": "Close menu (Esc)",
   "saved": "Saved to PBZFM.ini"
@@ -84,6 +88,8 @@ R"json({
   "q_custom": "カスタム",
   "toggle_key": "メニュー開閉",
   "capturing": "新しいキーを押してください…",
+  "screenshot": "スクリーンショット",
+  "shot_saved": "Screenshots フォルダに保存しました",
   "save": "設定を保存",
   "close_menu": "メニューを閉じる (Esc)",
   "saved": "PBZFM.ini に保存しました"
@@ -112,6 +118,8 @@ R"json({
   "q_custom": "사용자 지정",
   "toggle_key": "메뉴 열기/닫기",
   "capturing": "새 키를 누르세요...",
+  "screenshot": "화면 캡처",
+  "shot_saved": "Screenshots 폴더에 저장했습니다",
   "save": "설정 저장",
   "close_menu": "메뉴 닫기 (Esc)",
   "saved": "PBZFM.ini에 저장했습니다"

@@ -2,6 +2,8 @@
   "title": "PBZ-Framework Menu",
   "framework_section": "PBZ-Framework Menu",
   "page_settings": "Settings",
+  "screenshot": "Capture screen",
+  "shot_saved": "Saved to the Screenshots folder",
   "hint": "Independent DirectComposition overlay",
   "btn_test": "Test button",
   "count": "clicks",

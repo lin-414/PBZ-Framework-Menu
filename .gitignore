@@ -13,3 +13,7 @@ data/
 # editor junk
 .vs/
 .vscode/
+
+# local tooling / junk created at workspace root
+Python/
+%SystemDrive%/

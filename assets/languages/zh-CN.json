@@ -2,6 +2,8 @@
   "title": "PBZ-Framework Menu",
   "framework_section": "PBZ-Framework Menu",
   "page_settings": "设置",
+  "screenshot": "截取屏幕",
+  "shot_saved": "已保存到 Screenshots 文件夹",
   "hint": "DirectComposition 独立覆盖窗",
   "btn_test": "测试按钮",
   "count": "计数",

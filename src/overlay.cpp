@@ -14,6 +14,7 @@
 #include "menu.h"
 #include "layout.h"
 #include "schema.h"
+#include "theme.h"
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -24,6 +25,11 @@
 #include <imgui_impl_dx11.h>
 #include <algorithm>
 #include <cmath>
+#include <fstream>
+#include <vector>
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
 
 using Microsoft::WRL::ComPtr;
 
@@ -69,6 +75,8 @@ struct Overlay {
     LARGE_INTEGER qpcLast{};
     LARGE_INTEGER diagNext{};           // 1 Hz input/present diagnostics while the menu is open
     float presentMaxMs = 0.0f;
+    std::vector<RAWINPUTDEVICE> rawList;   // game's raw-input registrations, saved on open
+    bool rawListSaved = false;
 
     GameWindow* gw = nullptr;
     Config* cfg = nullptr;
@@ -80,28 +88,132 @@ struct Overlay {
 
 Overlay g_ov;
 
-std::atomic<int> g_rawInputCount{ 0 };   // WM_INPUT seen by the overlay (diagnostic)
-
 LRESULT CALLBACK OverlayWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     if (msg == WM_ERASEBKGND) return 1;
-    if (msg == WM_INPUT) g_rawInputCount.fetch_add(1, std::memory_order_relaxed);
     return DefWindowProcW(h, msg, w, l);
 }
 
-// Diagnostic only: own raw-input registration for the mouse. If WM_INPUT still
-// reaches us while the hook eats every move, raw input survives LL-hook
-// blocking on this Windows build and blocking has to target it directly.
-void SetRawInputDiag(bool on) {
-    RAWINPUTDEVICE rid{};
-    rid.usUsagePage = 0x01;
-    rid.usUsage = 0x02;
-    rid.dwFlags = on ? RIDEV_INPUTSINK : RIDEV_REMOVE;
-    rid.hwndTarget = on ? g_ov.hwnd : nullptr;
-    if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
-        Log("[ov] raw input diag %s failed err=%lu", on ? "on" : "off", GetLastError());
-    } else {
-        Log("[ov] raw input diag %s", on ? "on" : "off");
+// The game's camera runs on raw mouse input, and on this Windows build raw
+// input survives LL-hook blocking - eating the moves is not enough. Raw input
+// registration is process-wide, one entry per device: registering re-points
+// the delivery. So on menu open the mouse entry is re-pointed at OUR overlay
+// (INPUTSINK) and the game's exact saved list is restored on close - never
+// RIDEV_REMOVE (that leaves the game without its registration and its camera
+// dead until restart, verified in-game 2026-11-01).
+bool StealGameRawMouse() {
+    UINT n = 0;
+    GetRegisteredRawInputDevices(nullptr, &n, sizeof(RAWINPUTDEVICE));
+    std::vector<RAWINPUTDEVICE> saved(n);
+    UINT got = n;
+    if (n > 0 && GetRegisteredRawInputDevices(saved.data(), &got, sizeof(RAWINPUTDEVICE)) == 0) return false;
+    saved.resize(got);
+
+    RAWINPUTDEVICE ours{};
+    ours.usUsagePage = 0x01;
+    ours.usUsage = 0x02;
+    ours.dwFlags = RIDEV_INPUTSINK;   // deliver even though the game keeps focus
+    ours.hwndTarget = g_ov.hwnd;
+
+    std::vector<RAWINPUTDEVICE> next;
+    bool hadMouse = false;
+    for (const RAWINPUTDEVICE& d : saved) {
+        if (d.usUsagePage == ours.usUsagePage && d.usUsage == ours.usUsage) {
+            next.push_back(ours);   // re-point the game's mouse entry at us
+            hadMouse = true;
+        } else {
+            next.push_back(d);      // keyboard/gamepad entries survive verbatim
+        }
     }
+    if (!hadMouse) next.push_back(ours);
+
+    if (!RegisterRawInputDevices(next.data(), (UINT)next.size(), sizeof(RAWINPUTDEVICE))) {
+        Log("[ov] raw mouse re-point failed err=%lu", GetLastError());
+        return false;
+    }
+    g_ov.rawList = saved;
+    g_ov.rawListSaved = true;
+    Log("[ov] raw mouse re-pointed to overlay (%u entries saved)", (unsigned)got);
+    return true;
+}
+
+void RestoreGameRawMouse() {
+    // A saved list can be empty (nothing was registered before us): with no
+    // game entry to restore, fall through to removing ours - registering an
+    // empty list fails with ERROR_INVALID_PARAMETER and would leave our
+    // overlay registration live while reporting a restore.
+    if (g_ov.rawListSaved && !g_ov.rawList.empty()) {
+        if (!RegisterRawInputDevices(g_ov.rawList.data(), (UINT)g_ov.rawList.size(), sizeof(RAWINPUTDEVICE)))
+            Log("[ov] WARNING: raw input restore failed err=%lu", GetLastError());
+        else
+            Log("[ov] raw input registrations restored to game");
+        g_ov.rawListSaved = false;
+    } else {
+        // We registered without a game entry existing: remove only ours.
+        RAWINPUTDEVICE rm{};
+        rm.usUsagePage = 0x01;
+        rm.usUsage = 0x02;
+        rm.dwFlags = RIDEV_REMOVE;   // safe: no game mouse entry exists to destroy
+        rm.hwndTarget = nullptr;
+        if (!RegisterRawInputDevices(&rm, 1, sizeof(rm)))
+            Log("[ov] raw mouse removal failed err=%lu", GetLastError());
+    }
+}
+
+// Full composited-desktop capture of the game window region: DWM hands us the
+// final image, so the menu overlay itself is in the shot - N卡/PixPin style
+// global tools cannot run while the menu owns the input, this is the escape.
+static void CaptureGameScreen() {
+    GameWindow* gw = g_ov.gw;
+    if (!gw || gw->w <= 0 || gw->h <= 0) return;
+
+    std::vector<unsigned char> png;
+    bool ok = false;
+    HDC screen = GetDC(nullptr);
+    if (screen) {
+        HDC mem = CreateCompatibleDC(screen);
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = gw->w;
+        bi.bmiHeader.biHeight = -gw->h;   // top-down rows
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HBITMAP bmp = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (bmp && bits) {
+            HGDIOBJ old = SelectObject(mem, bmp);
+            BitBlt(mem, 0, 0, gw->w, gw->h, screen, gw->x, gw->y, SRCCOPY);
+            SelectObject(mem, old);
+            auto* px = (unsigned char*)bits;
+            for (int i = 0; i < gw->w * gw->h; ++i) std::swap(px[i * 4 + 0], px[i * 4 + 2]);  // BGRA -> RGBA
+            png.reserve((size_t)gw->w * gw->h * 4);
+            stbi_write_png_to_func([](void* ctx, void* data, int size) {
+                auto* out = (std::vector<unsigned char>*)ctx;
+                const auto* p = (const unsigned char*)data;
+                out->insert(out->end(), p, p + size);
+            }, &png, gw->w, gw->h, 4, px, gw->w * 4);
+            ok = !png.empty();
+        }
+        if (bmp) DeleteObject(bmp);
+        DeleteDC(mem);
+        ReleaseDC(nullptr, screen);
+    }
+    if (!ok) {
+        Log("[ov] screenshot FAILED (%dx%d)", gw->w, gw->h);
+        return;
+    }
+
+    std::wstring dir = ModRoot() + L"\\Screenshots";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t wide[MAX_PATH]{};
+    swprintf(wide, MAX_PATH, L"%s\\PBZFM_%04u%02u%02u_%02u%02u%02u.png", dir.c_str(),
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    std::ofstream file(wide, std::ios::binary);   // wide path: immune to the ANSI codepage
+    file.write((const char*)png.data(), (std::streamsize)png.size());
+    ok = (bool)file;
+    Log("[ov] screenshot %ls (%dx%d, %zu bytes)", wide, gw->w, gw->h, png.size());
 }
 
 bool CreateOverlayWindow() {
@@ -342,29 +454,7 @@ bool InitImGui() {
         return false;
     }
 
-    ImGui::StyleColorsDark();
-    ImGuiStyle& s = ImGui::GetStyle();
-    s.WindowRounding = 6.0f;
-    s.FrameRounding = 4.0f;
-    s.GrabRounding = 4.0f;
-    s.WindowBorderSize = 0.0f;
-    s.FramePadding = ImVec2(10, 6);
-    s.ItemSpacing = ImVec2(10, 6);
-    s.WindowPadding = ImVec2(12, 10);
-    s.FontScaleMain = 1.0f;
-    ImVec4* c = s.Colors;
-    c[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.08f, 0.11f, 0.94f);
-    c[ImGuiCol_TitleBg] = ImVec4(0.06f, 0.06f, 0.09f, 1.0f);
-    c[ImGuiCol_TitleBgActive] = ImVec4(0.10f, 0.10f, 0.16f, 1.0f);
-    c[ImGuiCol_FrameBg] = ImVec4(0.16f, 0.17f, 0.22f, 0.90f);
-    c[ImGuiCol_FrameBgHovered] = ImVec4(0.22f, 0.24f, 0.32f, 0.90f);
-    c[ImGuiCol_Button] = ImVec4(0.20f, 0.24f, 0.34f, 1.0f);
-    c[ImGuiCol_ButtonHovered] = ImVec4(0.30f, 0.38f, 0.55f, 1.0f);
-    c[ImGuiCol_ButtonActive] = ImVec4(0.35f, 0.55f, 0.95f, 1.0f);
-    c[ImGuiCol_SliderGrab] = ImVec4(0.35f, 0.55f, 0.95f, 1.0f);
-    c[ImGuiCol_SliderGrabActive] = ImVec4(0.45f, 0.65f, 1.0f, 1.0f);
-    c[ImGuiCol_CheckMark] = ImVec4(0.45f, 0.65f, 1.0f, 1.0f);
-    c[ImGuiCol_Text] = ImVec4(0.92f, 0.93f, 0.96f, 1.0f);
+    theme::ApplyPbzTheme(g_ov.cfg ? g_ov.cfg->uiOpacity : 0.94f);
 
     g_ov.imguiReady = true;
     Log("[ov] ImGui ready (backend dx11, dynamic CJK fonts)");
@@ -375,6 +465,12 @@ void RenderFrame() {
     if (!EnsureRtv()) return;  // retry next frame
 
     ImGuiIO& io = ImGui::GetIO();
+
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    float dt = (float)((double)(now.QuadPart - g_ov.qpcLast.QuadPart) / (double)g_ov.qpcFreq.QuadPart);
+    g_ov.qpcLast = now;
+    dt = std::clamp(dt, 1.0f / 240.0f, 0.1f);
 
     InputEvent ev;
     bool gotPos = false;
@@ -403,18 +499,12 @@ void RenderFrame() {
     }
     g_ov.mousePosValid = true;
 
-    LARGE_INTEGER now{};
-    QueryPerformanceCounter(&now);
-    float dt = (float)((double)(now.QuadPart - g_ov.qpcLast.QuadPart) / (double)g_ov.qpcFreq.QuadPart);
-    g_ov.qpcLast = now;
-    dt = std::clamp(dt, 1.0f / 240.0f, 0.1f);
     if (now.QuadPart >= g_ov.diagNext.QuadPart) {
         g_ov.diagNext.QuadPart = now.QuadPart + g_ov.qpcFreq.QuadPart;
         POINT rp{};
         GetCursorPos(&rp);
-        Log("[ov] diag: hookMoves=%d raw=%d imgui=(%.0f,%.0f) real=(%ld,%ld) present<=%.1fms",
+        Log("[ov] diag: hookMoves=%d imgui=(%.0f,%.0f) real=(%ld,%ld) present<=%.1fms",
             g_hookMoves.exchange(0, std::memory_order_relaxed),
-            g_rawInputCount.exchange(0, std::memory_order_relaxed),
             io.MousePos.x, io.MousePos.y, rp.x, rp.y, g_ov.presentMaxMs);
         g_ov.presentMaxMs = 0.0f;
     }
@@ -458,6 +548,10 @@ void RenderFrame() {
         g_ov.ui.requestSave = false;
         g_ov.cfg->Save(g_ov.iniPath);
         Log("[ov] config saved (menu action)");
+    }
+    if (g_ov.ui.requestScreenshot) {
+        g_ov.ui.requestScreenshot = false;
+        CaptureGameScreen();
     }
 
     {
@@ -521,7 +615,7 @@ void SetVisible(bool v) {
             g_ov.cursorHiddenByUs = false;
         }
         g_ov.gw->UnclipCursor();
-        SetRawInputDiag(true);
+        StealGameRawMouse();
         g_ov.mousePosValid = false;
         ImGui::GetIO().MouseDrawCursor = true;
         // The cursor sits over OUR overlay window, so its visibility follows
@@ -533,7 +627,7 @@ void SetVisible(bool v) {
         Log("[ov] menu open (hotkey, cursorHiddenByUs=%d)", (int)g_ov.cursorHiddenByUs);
     } else {
         ShowWindow(g_ov.hwnd, SW_HIDE);
-        SetRawInputDiag(false);
+        RestoreGameRawMouse();
         ImGui::GetIO().MouseDrawCursor = false;
         ShowCursor(TRUE);   // our queue: back to 0 (visible), exact undo of the open drain
         if (g_ov.cursorHiddenByUs) {

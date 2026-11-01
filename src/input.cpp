@@ -161,6 +161,11 @@ LRESULT CALLBACK KbProc(int code, WPARAM w, LPARAM l) {
     if (vk == VK_TAB && (GetAsyncKeyState(VK_MENU) & 0x8000))
         return CallNextHookEx(g_kbHook, code, w, l);
 
+    // Registered mod hotkeys stay live while the menu is open (screenshot /
+    // photo-mode toggles are meta-features, not game input). A dispatched key
+    // is swallowed and does not reach the menu widgets either.
+    if (RegistryDispatchHotkey(vk, up)) return 1;
+
     int ik = VkToImGuiKey(vk);
     if (ik != ImGuiKey_None) {
         InputEvent e{};
@@ -266,6 +271,8 @@ bool InputPop(InputEvent* out) {
 }
 
 void InputPushEvent(const InputEvent& e) { Push(e); }
+
+
 
 void InputRehook() {
     if (g_hookThreadId) PostThreadMessageW(g_hookThreadId, WM_APP_PBZFM_REHOOK, 0, 0);

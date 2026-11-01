@@ -11,6 +11,9 @@
 
 #include <windows.h>
 #include <shlobj.h>
+#include <dwmapi.h>
+
+#include "layout.h"
 #include <share.h>
 #include <cerrno>
 #include <cstdio>
@@ -144,11 +147,17 @@ void SendClickAt(float cx, float cy) {
 }
 
 bool SaveShot(const char* name) {
-    RECT r{};
-    GetClientRect(g_hwnd, &r);
-    POINT origin{ r.left, r.top };
-    ClientToScreen(g_hwnd, &origin);
-    int w = r.right - r.left, h = r.bottom - r.top;
+    // The host is not DPI-aware: GetClientRect/ClientToScreen are virtualized
+    // at 96 DPI while BitBlt reads physical screen pixels, so virtual rects
+    // miss the bottom of the panel. DWM frame bounds are physical regardless.
+    RECT fr{};
+    if (FAILED(DwmGetWindowAttribute(g_hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                     &fr, sizeof(fr)))) {
+        GetWindowRect(g_hwnd, &fr);
+    }
+    POINT origin{ fr.left, fr.top };
+    int w = fr.right - fr.left;
+    int h = fr.bottom - fr.top;
     HDC screen = GetDC(nullptr);
     HDC mem = CreateCompatibleDC(screen);
     BITMAPINFO bi{};
@@ -291,9 +300,11 @@ int main(int argc, char** argv) {
     SetTimer(g_hwnd, 7, 5200, nullptr);   // click demo button (queried)
     SetTimer(g_hwnd, 8, 5800, nullptr);   // shot 03_custom_page
     SetTimer(g_hwnd, 9, 6400, nullptr);   // shot 03b
-    SetTimer(g_hwnd, 10, 7000, nullptr);  // F8 close
-    SetTimer(g_hwnd, 11, 7600, nullptr);  // F9 demo hotkey
-    SetTimer(g_hwnd, 12, 8300, nullptr);  // shot 04_closed + finish
+    SetTimer(g_hwnd, 13, 6900, nullptr);  // click footer settings button (bottom-left)
+    SetTimer(g_hwnd, 14, 7700, nullptr);  // shot 05_settings_page
+    SetTimer(g_hwnd, 10, 8400, nullptr);  // F8 close
+    SetTimer(g_hwnd, 11, 9600, nullptr);  // F9 demo hotkey
+    SetTimer(g_hwnd, 12, 10500, nullptr); // shot 04_closed + finish
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -350,6 +361,12 @@ int main(int argc, char** argv) {
                     break;
                 }
                 case 8: SaveShot("03_custom_page.png"); break;
+                case 13:
+                    Log("click settings button at %.0f,%.0f",
+                        pbzfm::layout::kSettingsBtnCx, pbzfm::layout::kSettingsBtnCy);
+                    SendClickAt(pbzfm::layout::kSettingsBtnCx, pbzfm::layout::kSettingsBtnCy);
+                    break;
+                case 14: SaveShot("05_settings_page.png"); break;
                 case 10:
                     Log("F8 (close)");
                     if (g_synthetic && pfnToggleMenu) pfnToggleMenu(false); else SendKey(VK_F8);

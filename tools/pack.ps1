@@ -12,7 +12,7 @@ Copy-Item "$repo/assets/PBZFM.ini" "$stage/PBZFM/"
 Copy-Item "$repo/assets/languages/*.json" "$stage/PBZFM/languages/"
 Copy-Item "$repo/assets/README.txt" "$stage/PBZFM/"
 Copy-Item "$repo/sdk/pbzfm.h" "$stage/PBZFM/sdk/"
-$zip = "$repo/dist/PBZ-Framework-Menu_0.2.0.zip"
+$zip = "$repo/dist/PBZ-Framework-Menu_0.3.2.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path "$stage/PBZFM" -DestinationPath $zip
 Write-Host "packed: $zip"

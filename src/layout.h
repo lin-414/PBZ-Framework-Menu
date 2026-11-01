@@ -20,4 +20,9 @@ constexpr float kFirstBoolCy   = 181.0f;  // first schema item (checkbox) center
 constexpr float kTab2Cx        = 402.0f;  // second page tab center x
 constexpr float kTabCy         = 145.0f;  // page tab row center y
 
+// Footer settings button (panel bottom-left), center. Inside the 150-wide
+// button for either frame height (font 13..18 at ui_scale 1.0).
+constexpr float kSettingsBtnCx = 187.0f;  // kPanelX + WindowPadding.x + 75
+constexpr float kSettingsBtnCy = 540.0f;  // kPanelY + kPanelH - WindowPadding.y - frameH/2
+
 } } // namespace pbzfm::layout

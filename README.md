@@ -5,7 +5,11 @@
 [PBZPhotoMode](https://github.com/lin-414/PBZPhotoMode) 这类 UE4SS C++ DLL 模组提供
 **快捷键呼出的游戏内设置界面**、多语言、以及可由框架统一编辑的模组配置（含键位）。
 
-当前状态：**0.2.0 输入全吞 + 自绘光标方案已实机验证**（2026-11-01：游戏内 F8 菜单打开期间镜头冻结、菜单光标 1:1 跟随、系统光标隐藏，关闭后游戏输入即恢复正常）。
+当前状态：**0.3.2**。0.2.0 的输入全吞 + 自绘光标方案已实机验证（2026-11-01：游戏内
+F8 菜单打开期间镜头冻结、菜单光标 1:1 跟随、系统光标隐藏，关闭后游戏输入即恢复正常）。
+手柄适配（XInput：长按选择键呼出/摇杆虚拟光标/XInputEnable 冻结）已开发完成并经
+host 确定性回归，**应用户要求暂时搁置、未进正式包**——源码保留在 src/gamepad.*
+（未编译，gamepad.h 头部有完整恢复步骤）。
 
 ![菜单截图](docs/prototype_menu_open.png)
 
@@ -37,12 +41,25 @@ PBZPhotoMode 的实机取证（其 PROGRESS.md"六连判死"）证明了两条�
   每个事件的 pt=冻结位置+本事件增量（实机 raw≈hookMoves 证明本系统 Raw Input 不受
   LL 钩子阻断），故按"事件增量相对真实位置"自累积光标轨迹喂 ImGui（瞬移自归零，
   禁止每帧干预游戏的 ClipCursor/ShowCursor——实测会卡死游戏输入状态机）；系统光标
-  悬停在覆盖窗上，其可见性归覆盖窗线程队列所有，打开时在渲染线程直接排到隐藏；
+  悬停在覆盖窗上，其可见性归覆盖窗线程队列所有，打开时在渲染线程直接排到隐藏。
+  另两条实机铁律：Raw Input 注册是进程级、每设备一条，RegisterRawInputDevices 会
+  顶掉游戏同名设备的注册（本框架借此在菜单期间断掉相机增量——打开时改指向覆盖窗、
+  关闭时按保存的原表原样恢复）；RIDEV_REMOVE 是进程级摘除，会连带拆掉游戏自己的
+  Raw Input 注册（相机失效直到重启，2026-11-01 实测），任何情况下不得在关闭路径调用；
+  对游戏队列做每帧 ShowCursor/ClipCursor 干预同样会卡死其输入状态机，均已在终版移除。
+  已注册的模组热键在菜单打开时保持生效（分发后吞键、不进菜单控件；未注册的按键——
+  如 PhotoMode 的截图键——仍被吞，需模组侧经 RegistryAddHotkey 注册才会分发）；
 - 光标显示/隐藏通过子类化游戏 WndProc 投递到窗口线程执行（ShowCursor 是线程相关的）；
+- 框架设置页自带"截取屏幕"按钮：BitBlt 合成后的桌面区域（游戏窗口范围，**含菜单
+  界面本身**），PNG 存到 ModRoot\Screenshots\——N卡/PixPin 这类全局截图工具的热键
+  在菜单打开期间被输入隔离拦截且交互式选区工具拿不到鼠标，由框架自带截图兜底；
 - 配置：PBZFM.ini（容错解析，菜单保存写回）；多语言：languages/*.json（扁平 JSON，
   热切换，内嵌兜底，内置 zh-CN / en-US / ja-JP / ko-KR）；客户端模组的分区名/页签/
   设置项 label 以文本为 key 参与查表（查不到原样显示）；CJK 字体：按界面语言加载系统
-  字体（中文/日文用微软雅黑，韩文 UI 优先 Malgun Gothic，ImGui 1.92 动态字体图集）。
+  字体（中文/日文用微软雅黑，韩文 UI 优先 Malgun Gothic，ImGui 1.92 动态字体图集）；
+  界面主题：玄墨鎏金（src/theme，取自游戏 HUD 的配色语言——玄墨底、银色发丝线、
+  鎏金高亮、朱砂点缀，全直角 + 1px 细边框，标题栏金线/银括角/朱砂印章装饰，
+  键位捕获态为朱砂；装饰经前景绘制列表绘制，规避 1.92 窗口列表的标题栏裁剪）。
 
 ## 已验证（模拟游戏窗口，host 自测）
 
@@ -54,6 +71,8 @@ PBZPhotoMode 的实机取证（其 PROGRESS.md"六连判死"）证明了两条�
 | 配置保存/加载（PBZFM.ini 往返） | ✅ |
 | 语言表加载与切换（zh-CN/en-US/ja-JP/ko-KR 内嵌兜底 + 磁盘覆盖回归，24 条/语言） | ✅ |
 | 微软雅黑 CJK 字体加载 | ✅ |
+| 玄墨鎏金主题（HUD 配色/直角发丝线/标题栏装饰，host 截图比对） | ✅ 2026-11-01 |
+| 框架设置入口移出侧边栏（模组列表不再混入框架项），面板左下角"设置"按钮直达框架设置页 | ✅ 2026-11-01 |
 | 导入表无 d3d11/dxgi/dcomp（运行时加载） | ✅ |
 | 干净卸载（host FreeLibrary 全链退出） | ✅ |
 | **实机**：UE4SS 生命周期接入（start_mod/uninstall_mod 空实现） | ✅ 2026-11-01 |
@@ -64,6 +83,7 @@ PBZPhotoMode 的实机取证（其 PROGRESS.md"六连判死"）证明了两条�
 | **实机**：菜单打开期间镜头冻结、菜单光标 1:1 跟随、系统光标隐藏；关闭后相机与游戏菜单光标即恢复 | ✅ 2026-11-01 |
 | **实机**：经框架界面改绑 PBZPhotoMode 键位（key_toggle 捕获）并正常保存 | ✅ 2026-11-01 |
 | **实机**：界面拖动移动/调整大小保留（会话内） | ✅ 2026-11-01 |
+| 手柄适配（长按选择键呼出/A 点击/摇杆/XInputEnable 冻结往返）host 回归全绿 | ✅ 2026-11-01（0.3.1 已搁置，未进包） |
 
 自测方式：`host/pbzfm_host.exe` 注册一个名为 `UnrealWindow` 的窗口（框架寻找的目标类）、
 `LoadLibrary(PBZFM.dll)`（与 UE4SS 加载方式一致），脚本化 SendInput：F8 → 移动 → 点击 →
@@ -79,7 +99,7 @@ TestDispatchHotkey）：不经 OS 输入流，可在有人正在使用桌面时�
 
 ```bat
 build_all.bat            :: 构建（cmake + ninja），产物 build\PBZFM.dll + build\pbzfm_host.exe
-tools\pack.ps1           :: 出 dist\PBZ-Framework-Menu_0.2.0.zip（UE4SS 模组包）
+tools\pack.ps1           :: 出 dist\PBZ-Framework-Menu_0.3.2.zip（UE4SS 模组包）
 ```
 
 **部署约定**：本仓库的自动化只到"构建 + 打包 dist zip"为止——**不向游戏目录部署或复制
@@ -88,7 +108,7 @@ tools\pack.ps1           :: 出 dist\PBZ-Framework-Menu_0.2.0.zip（UE4SS 模组
 ## 游戏内安装（用户用模组管理器自行完成，自动化不碰游戏目录）
 
 1. 安装 [UE4SS for PBZ](https://www.nexusmods.com/phantombladezero/mods/5)（KintaroModding fork）。
-2. 用模组管理器（或手动解压）把 `dist/PBZ-Framework-Menu_0.2.0.zip` 装到
+2. 用模组管理器（或手动解压）把 `dist/PBZ-Framework-Menu_0.3.2.zip` 装到
    `<游戏目录>\platform\steam\ue4ss\Mods\`，形成
    `ue4ss\Mods\PBZFM\{dlls\PBZFM.dll, enabled.txt, PBZFM.ini, languages\}`。
 3. 启动游戏按 F8；验证清单见包内 README.txt。排障先看 `Documents\PBZ\Logs\PBZFM.log`
@@ -98,7 +118,7 @@ tools\pack.ps1           :: 出 dist\PBZ-Framework-Menu_0.2.0.zip（UE4SS 模组
 
 ```
 src/            PBZFM.dll 源码（pbzfm 入口 / overlay DComp 渲染 / input 钩子 /
-                game_window 定位与子类化 / config / i18n / menu）
+                gamepad XInput 手柄 / game_window 定位与子类化 / config / i18n / menu / theme）
 host/           测试宿主（模拟 UnrealWindow + 脚本输入 + 截图）
 assets/         随包分发文件（PBZFM.ini、languages/*.json、README.txt）
 tools/          build.bat / pack.ps1
@@ -116,5 +136,7 @@ docs/           自测截图
    AddConfigSchema(设置项描述) / 翻译表注册`；客户端模组 `GetModuleHandleW(L"PBZFM.dll")`
    + `GetProcAddress` 接入（同进程）。
 3. **设置 schema**：toggle/slider/keybind/enum/combo 通用控件 + 按 mod 写回 config.ini + 变更回调。
-4. 主题 JSON、手柄导航、游戏暂停（复用 PBZPhotoMode 已验证的暂停栈）。
+4. 手柄导航：开发完成（0.3.1 host 回归全绿）但**应用户要求暂时搁置、未进正式包**；
+   源码保留在 src/gamepad.*（未编译，恢复步骤见 gamepad.h 头注）。剩余：游戏暂停
+   （复用 PBZPhotoMode 已验证的暂停栈）、主题 JSON。
 5. 把 PBZPhotoMode 的 ImGui 诊断面板接成第一个客户端（其 MenuView/MenuActions 快照桥直接复用）。

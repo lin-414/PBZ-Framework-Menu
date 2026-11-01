@@ -2,6 +2,8 @@
   "title": "PBZ-Framework Menu",
   "framework_section": "PBZ-Framework Menu",
   "page_settings": "설정",
+  "screenshot": "화면 캡처",
+  "shot_saved": "Screenshots 폴더에 저장했습니다",
   "hint": "독립 실행형 DirectComposition 오버레이",
   "btn_test": "테스트 버튼",
   "count": "클릭 수",

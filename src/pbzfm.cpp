@@ -33,7 +33,7 @@ std::atomic<int>  g_btnScrX{ -1 };
 std::atomic<int>  g_btnScrY{ -1 };
 std::atomic<int>  g_hookMoves{ 0 };
 
-const char* const kVersion = "0.2.0";
+const char* const kVersion = "0.3.2";
 
 namespace {
 

@@ -4,6 +4,7 @@
 #include "i18n.h"
 #include "config.h"
 #include "registry.h"
+#include "theme.h"
 
 #include <imgui.h>
 #include <algorithm>
@@ -330,7 +331,9 @@ void RenderSchemaForm(ConfigDef& cfg, const I18n& i18n, float dt) {
                                  g_captureKind.load(std::memory_order_relaxed) == CAP_SCHEMA_KEY &&
                                  g_capCfg == (void*)&cfg && g_capItem == (void*)&it;
                 if (capturing) {
+                    theme::PushCapturingStyle();
                     ImGui::Button(i18n.T("capturing"), ImVec2(150.0f, 0.0f));
+                    theme::PopCapturingStyle();
                 } else if (ImGui::Button(kb, ImVec2(150.0f, 0.0f))) {
                     g_capCfg = (void*)&cfg;
                     g_capItem = (void*)&it;
