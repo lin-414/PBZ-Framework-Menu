@@ -421,24 +421,9 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
         s_frameworkRegistered = true;
     }
 
-    // First frame (or a vanished selection): open on the first mod content,
-    // straight onto settings when none has registered yet. The tree itself
-    // starts fully COLLAPSED - the selected row may sit inside a collapsed
-    // branch (its content still shows, like an editor opening a file while
-    // the explorer stays folded).
-    if (!selSettings && (selPath.empty() || !RegistryFindPath(selPath.c_str()))) {
-        selPath.clear();
-        selPage = 0;
-        for (const auto& r : sections) {
-            if (r.get() == fw) continue;
-            int idx = 0;
-            if (const Section* f = FirstContentNode(*r, &idx)) {
-                selPath = RegistryPathOf(f);
-                selPage = idx;
-                break;
-            }
-        }
-    }
+    // No auto-selection: until the user picks a category the content area
+    // shows a hint, and the tree stays fully collapsed. The last selection
+    // is remembered for the session (selPath persists across menu open/close).
 
     // Footer band: both columns stop above it so the footer buttons stay
     // inside the fixed-size window (a full-height content child used to push
@@ -486,7 +471,13 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
         contentNode = RegistryFindPath(selPath.c_str());
         contentPage = selPage;
     }
-    if (contentNode && !contentNode->pages.empty()) {
+    if (!contentNode) {
+        // Nothing picked yet (or the picked node was removed): invite instead
+        // of silently showing some mod's page.
+        ImGui::TextDisabled("%s", i18n.T("select_hint"));
+    } else if (contentNode->pages.empty()) {
+        ImGui::TextDisabled("(no pages)");
+    } else {
         if (contentPage < 0 || contentPage >= (int)contentNode->pages.size()) contentPage = 0;
         Page& pg = contentNode->pages[contentPage];
         if (pg.schemaCfg) currentSchema = (ConfigDef*)pg.schemaCfg;
@@ -514,8 +505,6 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
         } else if (pg.schemaCfg) {
             RenderSchemaForm(*(ConfigDef*)pg.schemaCfg, i18n, dt);
         }
-    } else {
-        ImGui::TextDisabled("(no pages)");
     }
     ImGui::EndChild();
 

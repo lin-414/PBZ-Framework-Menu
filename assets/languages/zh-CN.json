@@ -30,5 +30,6 @@
   "search": "搜索",
   "search_hint": "输入以筛选模组…",
   "theme": "主题",
-  "theme_builtin": "玄墨鎏金"
+  "theme_builtin": "玄墨鎏金",
+  "select_hint": "在左侧选择一个分类"
 }

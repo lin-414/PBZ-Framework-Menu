@@ -38,7 +38,8 @@ R"json({
   "search": "搜索",
   "search_hint": "输入以筛选模组…",
   "theme": "主题",
-  "theme_builtin": "玄墨鎏金"
+  "theme_builtin": "玄墨鎏金",
+  "select_hint": "在左侧选择一个分类"
 })json";
 
 static const char* kJsonEn =
@@ -74,7 +75,8 @@ R"json({
   "search": "Search",
   "search_hint": "Type to filter mods...",
   "theme": "Theme",
-  "theme_builtin": "Ink & Gold"
+  "theme_builtin": "Ink & Gold",
+  "select_hint": "Pick a category on the left"
 })json";
 
 static const char* kJsonJp =
@@ -110,7 +112,8 @@ R"json({
   "search": "検索",
   "search_hint": "入力してモッドを絞り込む…",
   "theme": "テーマ",
-  "theme_builtin": "玄墨鎏金"
+  "theme_builtin": "玄墨鎏金",
+  "select_hint": "左のカテゴリを選択してください"
 })json";
 
 static const char* kJsonKr =
@@ -146,7 +149,8 @@ R"json({
   "search": "검색",
   "search_hint": "입력하여 모드 필터링...",
   "theme": "테마",
-  "theme_builtin": "먹과 금"
+  "theme_builtin": "먹과 금",
+  "select_hint": "왼쪽에서 카테고리를 선택하세요"
 })json";
 
 static std::wstring Utf8ToWide(const std::string& u) {

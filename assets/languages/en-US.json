@@ -30,5 +30,6 @@
   "search": "Search",
   "search_hint": "Type to filter mods...",
   "theme": "Theme",
-  "theme_builtin": "Ink & Gold"
+  "theme_builtin": "Ink & Gold",
+  "select_hint": "Pick a category on the left"
 }
