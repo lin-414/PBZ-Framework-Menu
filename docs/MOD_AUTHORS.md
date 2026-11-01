@@ -4,8 +4,6 @@
 > [sdk/pbzfm.h](../sdk/pbzfm.h)（随 dist zip 分发于 PBZFM/sdk/），唯一外部头是
 > windows.h；完整可编译参考 [host/demo_mod.cpp](../host/demo_mod.cpp)。
 
-## 模组作者接入指南（C API / SDK）
-
 任何加载进游戏进程的 DLL（实践中就是 UE4SS C++ DLL 模组，PBZPhotoMode 形态）都可以
 向菜单注册自己的侧边栏分区、设置页、自绘页与游戏内热键。接入**零构建依赖**：只
 include [sdk/pbzfm.h](sdk/pbzfm.h)（dist zip 内路径 `PBZFM/sdk/pbzfm.h`），唯一
@@ -24,9 +22,10 @@ include [sdk/pbzfm.h](sdk/pbzfm.h)（dist zip 内路径 `PBZFM/sdk/pbzfm.h`）�
 ### 工作原理与前提
 
 - 框架本体是 UE4SS 模组 `ue4ss\Mods\PBZFM\dlls\PBZFM.dll`。你的模组调用内联的
-  `PBZFM_LoadApi(&api)`：内部 `GetModuleHandleW(L"PBZFM.dll")` 找到框架、解析全部
-  函数指针，并校验运行时 ABI 版本等于编译时的 `PBZFM_ABI_VERSION`（当前 1），任一
-  环节失败返回 0。
+  `PBZFM_LoadApi(&api)`：内部 `GetModuleHandleW(L"PBZFM.dll")` 找到框架、解析函数指针
+  ——必需核心（v1 导出）全部解析成功且运行时 API 版本 ≥ 头文件的
+  `PBZFM_ABI_VERSION` 才算成功；0.4.0 新增导出按可选解析，缺失时对应指针为 NULL。
+  任一必需环节失败返回 0（语义见上方《版本与兼容策略》）。
 - UE4SS 按目录名字母序加载模组，PBZFM 可能晚于你的 DLL 出现：**不要在 DllMain 里
   注册**。在 DllMain 里只起一个自己的线程，轮询 `PBZFM_LoadApi` 直到成功（参考
   实现轮询 200 × 100ms）。
@@ -78,7 +77,7 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
 
 | 场景 | 运行线程 | 注意 |
 | --- | --- | --- |
-| SetSection / ConfigCreate / ConfigAdd* / AddHotkey 注册 | 任意（自己的线程） | 绝不在 DllMain；框架未加载就轮询 |
+| SetSection / ConfigCreate / ConfigAdd* / AddHotkey(Ex) / OnMenuEvent 注册 | 任意（自己的线程） | 绝不在 DllMain；框架未加载就轮询；v2 导出判空后调用 |
 | 自定义页渲染回调（AddSectionItem 的 fn） | 框架渲染线程 | 仅菜单打开且你的页签选中时每帧执行；保持快速、绝不阻塞 |
 | 设置变更回调（ConfigOnChange 的 fn） | 框架渲染线程 | 每次提交编辑触发；值已更新，用 Get* 读回 |
 | 游戏热键回调（AddHotkey/AddHotkeyEx 的 fn） | 框架输入钩子线程 | 需要游戏线程的数据自行 marshal |
@@ -229,12 +228,13 @@ en-US 表 → 查不到原样显示。因此：
 | 文件 | 位置 |
 | --- | --- |
 | 框架本体 | `ue4ss\Mods\PBZFM\dlls\PBZFM.dll` |
-| 框架配置（呼出键 / 语言 / UI 缩放与不透明度） | `ue4ss\Mods\PBZFM\PBZFM.ini` |
+| 框架配置（呼出键 / 语言 / UI 缩放与不透明度 / 主题） | `ue4ss\Mods\PBZFM\PBZFM.ini` |
 | 你的设置数据 | `ue4ss\Mods\PBZFM\data\<store>.json` |
 | 翻译表 | `ue4ss\Mods\PBZFM\languages\<lang>.json` |
 | 日志（排障先看） | `Documents\PBZ\Logs\PBZFM.log`（不可写时回落 `Mods\PBZFM\PBZFM.log`） |
 | 框架"截取屏幕"按钮产物 | `ue4ss\Mods\PBZFM\Screenshots\` |
 
-另有 `PBZFM_IsMenuOpen()` 供客户端感知菜单开关；`PBZFM_GetSectionCount /
+另有 `PBZFM_IsMenuOpen()` 供客户端轮询菜单开关（0.4.0 起更推荐上面的 `OnMenuEvent` 事件）；
+`PBZFM_GetSectionCount /`PBZFM_GetSectionCount /
 GetSectionNameUtf8 / GetSectionRect / GetLastSchemaItemRect` 是 host 自动化测试用的
 几何查询，常规模组不需要。
