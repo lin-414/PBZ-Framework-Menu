@@ -279,8 +279,8 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
     ImGui::EndChild();
 
     // Footer row, pinned to the panel's bottom-left corner: the framework
-    // settings switch (gold while open), save for the schema page being
-    // viewed, close always.
+    // settings switch (gold while open) and save for the schema page being
+    // viewed. Closing lives in the title bar (x / Esc / hotkey).
     ImGui::SetCursorPosX(st.WindowPadding.x);
     const bool settingsOpen = selSection == -1;
     if (settingsOpen) ImGui::PushStyleColor(ImGuiCol_Text, theme::kGoldBright);
@@ -295,10 +295,6 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
             SchemaSaveConfigNow(currentSchema);
             ui.saveFlash = 2.0f;
         }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button(i18n.T("close_menu"), ImVec2(150.0f, 0.0f))) {
-        g_closeRequest.store(true, std::memory_order_release);
     }
     if (ui.saveFlash > 0.0f) {
         ImGui::SameLine();
