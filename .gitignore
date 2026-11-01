@@ -1,6 +1,7 @@
 # build artifacts
 build/
 dist/
+*.obj
 
 # runtime state
 *.log
