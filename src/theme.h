@@ -7,6 +7,8 @@
 #pragma once
 
 #include <imgui.h>
+#include <string>
+#include <vector>
 
 namespace pbzfm { namespace theme {
 
@@ -39,5 +41,15 @@ void ApplyPbzTheme(float windowOpacity);
 // parry marks). Pair PushCapturingStyle/PopCapturingStyle.
 void PushCapturingStyle();
 void PopCapturingStyle();
+
+// Theme files (v0.4): "ink" is the built-in palette; any other name loads
+// ModRoot\themes\<name>.json over the built-in style. Colors ("Text",
+// "ButtonHovered", ... as "#RRGGBB"/"#RRGGBBAA"), corner rounding and border
+// sizes are overridable; layout paddings are NOT (the host's exported-rect
+// automation depends on them). A missing or unparsable file keeps the
+// built-in style. Render thread only.
+void ApplyThemeByName(const std::string& nameUtf8);
+// "ink" first, then the sorted stems of ModRoot\themes\*.json.
+std::vector<std::string> ListThemeNames();
 
 } } // namespace pbzfm::theme

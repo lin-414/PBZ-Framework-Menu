@@ -12,7 +12,8 @@ namespace pbzfm {
 class I18n;
 struct MenuUi;
 
-enum SchemaType { SCH_GROUP = 0, SCH_BOOL = 1, SCH_INT = 2, SCH_FLOAT = 3, SCH_ENUM = 4, SCH_KEY = 5 };
+enum SchemaType { SCH_GROUP = 0, SCH_BOOL = 1, SCH_INT = 2, SCH_FLOAT = 3, SCH_ENUM = 4, SCH_KEY = 5,
+                  SCH_KEYCOMBO = 6 };   // v2: chord keybind, ival = vk | (mods << 8)
 
 struct SchemaItem {
     int type = SCH_GROUP;
@@ -55,7 +56,7 @@ bool SchemaGetLastItemRect(float out_xyxy[4]);   // overlay-client px, false unt
 
 // Key capture targets (render thread only; the capture mode flags are the
 // atomics in common.h).
-enum CaptureKind { CAP_NONE = 0, CAP_TOGGLE = 1, CAP_SCHEMA_KEY = 2 };
+enum CaptureKind { CAP_NONE = 0, CAP_TOGGLE = 1, CAP_SCHEMA_KEY = 2, CAP_SCHEMA_KEYCOMBO = 3 };
 extern void* g_capCfg;         // ConfigDef* for CAP_SCHEMA_KEY
 extern void* g_capItem;        // SchemaItem* target of the active capture
 

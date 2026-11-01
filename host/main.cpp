@@ -42,6 +42,8 @@ typedef void (*PBZFM_TestInjectMoveFn)(int, int);
 typedef void (*PBZFM_TestInjectButtonFn)(int, bool);
 typedef void (*PBZFM_TestToggleMenuFn)(bool);
 typedef bool (*PBZFM_TestDispatchHotkeyFn)(unsigned);
+typedef void (*PBZFM_TestSetPassthroughFn)(unsigned, bool, bool, bool, bool, bool);
+typedef int  (*PBZFM_TestPtActiveFn)();
 
 PBZFM_pfn_int pfnSectionCount;
 PBZFM_pfn_GetSectionName pfnSectionName;
@@ -51,11 +53,14 @@ PBZFM_TestInjectMoveFn pfnInjectMove;
 PBZFM_TestInjectButtonFn pfnInjectButton;
 PBZFM_TestToggleMenuFn pfnToggleMenu;
 PBZFM_TestDispatchHotkeyFn pfnDispatchHotkey;
+PBZFM_TestSetPassthroughFn pfnSetPassthrough;
+PBZFM_TestPtActiveFn pfnPtActive;
 
 // --synthetic: drive the menu through the DLL's test-injection exports
 // instead of the real input stream, whose delivery depends on an
 // uncontended input desktop (a human using the machine races the strokes).
 bool g_synthetic = false;
+int g_fail = 0;   // passthrough scenario result (exit code)
 
 void Log(const char* fmt, ...) {
     va_list args;
@@ -120,6 +125,39 @@ void SendMouseButton(bool down) {
     in.type = INPUT_MOUSE;
     in.mi.dwFlags = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
     SendInput(1, &in, sizeof(INPUT));
+}
+
+// Human-paced chord: modifier downs, pause, key tap, pause, modifier ups. A
+// single SendInput burst would leave the batch tail in flight while the DLL's
+// replay fires, and the hook chain is allowed to skip/reorder around a busy
+// hook - the phases mirror how a real user holds the modifiers.
+void SendChord(const WORD* mods, int nMods, WORD vk) {
+    INPUT in[10]{};
+    int n = 0;
+    for (int i = 0; i < nMods; ++i) { in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = mods[i]; ++n; }
+    SendInput(n, in, sizeof(INPUT));
+    Sleep(120);
+    n = 0;
+    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = vk; ++n;
+    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = vk; in[n].ki.dwFlags = KEYEVENTF_KEYUP; ++n;
+    SendInput(n, in, sizeof(INPUT));
+    Sleep(80);
+    n = 0;
+    for (int i = nMods - 1; i >= 0; --i) { in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = mods[i]; in[n].ki.dwFlags = KEYEVENTF_KEYUP; ++n; }
+    SendInput(n, in, sizeof(INPUT));
+}
+
+// The passthrough auto-close needs the host window to be the foreground
+// (the hook compares the foreground against the "game" window).
+void FocusHost() {
+    HWND fg = GetForegroundWindow();
+    if (fg == g_hwnd) return;
+    DWORD fgTid = GetWindowThreadProcessId(fg, nullptr);
+    DWORD myTid = GetCurrentThreadId();
+    if (fgTid && fgTid != myTid) AttachThreadInput(myTid, fgTid, TRUE);
+    BringWindowToTop(g_hwnd);
+    SetForegroundWindow(g_hwnd);
+    if (fgTid && fgTid != myTid) AttachThreadInput(myTid, fgTid, FALSE);
 }
 
 void SendClickAt(float cx, float cy) {
@@ -290,6 +328,8 @@ int main(int argc, char** argv) {
     pfnInjectButton = (PBZFM_TestInjectButtonFn)GetProcAddress(g_dll, "PBZFM_TestInjectButton");
     pfnToggleMenu = (PBZFM_TestToggleMenuFn)GetProcAddress(g_dll, "PBZFM_TestToggleMenu");
     pfnDispatchHotkey = (PBZFM_TestDispatchHotkeyFn)GetProcAddress(g_dll, "PBZFM_TestDispatchHotkey");
+    pfnSetPassthrough = (PBZFM_TestSetPassthroughFn)GetProcAddress(g_dll, "PBZFM_TestSetPassthrough");
+    pfnPtActive = (PBZFM_TestPtActiveFn)GetProcAddress(g_dll, "PBZFM_TestPassthroughActive");
 
     SetTimer(g_hwnd, 1, 900, nullptr);    // shot 00_initial
     SetTimer(g_hwnd, 2, 1500, nullptr);   // F8 -> menu
@@ -304,7 +344,11 @@ int main(int argc, char** argv) {
     SetTimer(g_hwnd, 14, 7700, nullptr);  // shot 05_settings_page
     SetTimer(g_hwnd, 10, 8400, nullptr);  // F8 close
     SetTimer(g_hwnd, 11, 9600, nullptr);  // F9 demo hotkey
-    SetTimer(g_hwnd, 12, 10500, nullptr); // shot 04_closed + finish
+    SetTimer(g_hwnd, 15, 9800, nullptr);  // F8 open (passthrough scenario, real input only)
+    SetTimer(g_hwnd, 16, 10600, nullptr); // Ctrl+Alt+F9 chord -> borrow window opens
+    SetTimer(g_hwnd, 17, 12200, nullptr); // grace (1 s) elapsed + move -> isolation resumed
+    SetTimer(g_hwnd, 18, 12600, nullptr); // F8 close
+    SetTimer(g_hwnd, 12, 13500, nullptr); // shot 04_closed + finish
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -379,6 +423,42 @@ int main(int argc, char** argv) {
                         SendKey(VK_F9);
                     }
                     break;
+                case 15:
+                    if (g_synthetic) break;   // the synthetic channel bypasses the hooks
+                    Log("F8 (open, passthrough scenario)");
+                    SendKey(VK_F8);
+                    break;
+                case 16: {
+                    if (g_synthetic || !pfnSetPassthrough || !pfnPtActive) break;
+                    FocusHost();
+                    // Ctrl+Alt+F9: deliberately not a real tool's hotkey, so the
+                    // run never pops a live PixPin/NVIDIA capture overlay.
+                    pfnSetPassthrough(VK_F9, true, false, true, false, true);   // exercise the replay path
+                    Sleep(100);
+                    WORD mods[2] = { VK_CONTROL, VK_MENU };
+                    SendChord(mods, 2, VK_F9);
+                    Sleep(250);   // covers the paced chord (~200 ms) + probe
+                    int st = pfnPtActive();
+                    Log("passthrough after Ctrl+Alt+F9: %d (expect 1)%s", st, st == 1 ? "" : "  <- FAILED");
+                    if (st != 1) g_fail = 1;
+                    break;
+                }
+                case 17: {
+                    if (g_synthetic || !pfnPtActive) break;
+                    SendMouseMove(kW / 2, kH / 2);
+                    Sleep(300);
+                    int st = pfnPtActive();
+                    bool fgHost = GetForegroundWindow() == g_hwnd;
+                    Log("passthrough after grace+move: %d (expect 0)%s", st,
+                        !fgHost ? "  (fg not on host: check skipped)" : (st == 0 ? "" : "  <- FAILED"));
+                    if (fgHost && st != 0) g_fail = 1;
+                    break;
+                }
+                case 18:
+                    if (g_synthetic) break;
+                    Log("F8 (close, passthrough scenario)");
+                    SendKey(VK_F8);
+                    break;
                 case 12:
                     SaveShot("04_closed.png");
                     Finish();
@@ -386,5 +466,6 @@ int main(int argc, char** argv) {
             }
         }
     }
-    return 0;
+    Log("host done, fail=%d", g_fail);
+    return g_fail ? 1 : 0;
 }

@@ -1,6 +1,7 @@
 #include "schema.h"
 
 #include "common.h"
+#include "flatjson.h"
 #include "i18n.h"
 #include "config.h"
 #include "registry.h"
@@ -60,70 +61,6 @@ bool WriteFileText(const std::wstring& path, const std::string& utf8) {
     return ok;
 }
 
-// Flat typed JSON: {"key": true|123|1.5|"text", ...}. Values are kept as raw
-// strings and coerced by the schema item types on load.
-bool ParseFlatTypedJson(const std::string& utf8, std::map<std::string, std::string>& raw) {
-    size_t i = 0;
-    const size_t n = utf8.size();
-    auto skipWs = [&](size_t& p) { while (p < n && (utf8[p] == ' ' || utf8[p] == '\t' || utf8[p] == '\r' || utf8[p] == '\n')) ++p; };
-    auto parseString = [&](size_t& p, std::string& str) -> bool {
-        skipWs(p);
-        if (p >= n || utf8[p] != '"') return false;
-        ++p;
-        str.clear();
-        while (p < n) {
-            char c = utf8[p++];
-            if (c == '"') return true;
-            if (c == '\\' && p < n) {
-                char e = utf8[p++];
-                switch (e) {
-                    case '"': str += '"'; break;
-                    case '\\': str += '\\'; break;
-                    case '/': str += '/'; break;
-                    case 'n': str += '\n'; break;
-                    case 't': str += '\t'; break;
-                    default: str += e; break;
-                }
-            } else str += c;
-        }
-        return false;
-    };
-    auto parseRawValue = [&](size_t& p, std::string& str) -> bool {
-        skipWs(p);
-        size_t start = p;
-        while (p < n && utf8[p] != ',' && utf8[p] != '}') ++p;
-        str = utf8.substr(start, p - start);
-        // trim
-        size_t a = str.find_first_not_of(" \t\r\n");
-        size_t b = str.find_last_not_of(" \t\r\n");
-        if (a == std::string::npos) return false;
-        str = str.substr(a, b - a + 1);
-        return true;
-    };
-    skipWs(i);
-    if (i >= n || utf8[i] != '{') return false;
-    ++i;
-    while (true) {
-        skipWs(i);
-        if (i < n && utf8[i] == '}') return true;
-        std::string key, val;
-        if (!parseString(i, key)) return false;
-        skipWs(i);
-        if (i >= n || utf8[i] != ':') return false;
-        ++i;
-        if (i < n && utf8[i] == '"') {
-            if (!parseString(i, val)) return false;
-        } else {
-            if (!parseRawValue(i, val)) return false;
-        }
-        raw[key] = val;
-        skipWs(i);
-        if (i < n && utf8[i] == ',') { ++i; continue; }
-        if (i < n && utf8[i] == '}') return true;
-        return false;
-    }
-}
-
 } // namespace
 
 SchemaItem* ConfigDef::Find(const char* key) {
@@ -138,7 +75,7 @@ bool ConfigDef::Load(const std::wstring& path) {
     std::string text = ReadFileText(path);
     if (text.empty()) return false;
     std::map<std::string, std::string> raw;
-    if (!ParseFlatTypedJson(text, raw)) {
+    if (!ParseFlatJsonRaw(text, raw)) {
         Log("[schema] store %s: unparsable json, ignored", store.c_str());
         return false;
     }
@@ -153,6 +90,7 @@ bool ConfigDef::Load(const std::wstring& path) {
             case SCH_INT:
             case SCH_ENUM:
             case SCH_KEY:
+            case SCH_KEYCOMBO:   // packed vk | (mods << 8)
                 it.ival = strtoll(v.c_str(), nullptr, 10);
                 break;
             case SCH_FLOAT:
@@ -198,6 +136,7 @@ bool ConfigDef::Save(const std::wstring& path) {
             case SCH_INT:
             case SCH_ENUM:
             case SCH_KEY:
+            case SCH_KEYCOMBO:
                 snprintf(buf, sizeof(buf), "  \"%s\": %lld", it.key.c_str(), it.ival);
                 out += buf;
                 break;
@@ -338,6 +277,28 @@ void RenderSchemaForm(ConfigDef& cfg, const I18n& i18n, float dt) {
                     g_capCfg = (void*)&cfg;
                     g_capItem = (void*)&it;
                     g_captureKind.store(CAP_SCHEMA_KEY, std::memory_order_relaxed);
+                    g_captureMode.store(1, std::memory_order_relaxed);
+                }
+                break;
+            }
+            case SCH_KEYCOMBO: {
+                ImGui::TextUnformatted(i18n.T(it.label.c_str()));
+                ImGui::SameLine(0.0f, 12.0f);
+                unsigned vk = (unsigned)it.ival & 0xFFu;
+                unsigned mods = ((unsigned)it.ival >> 8) & 0xFu;
+                char kb[96];
+                snprintf(kb, sizeof(kb), "[%s]", Config::KeyModsToString(vk, mods).c_str());
+                bool capturing = g_captureMode.load(std::memory_order_relaxed) == 1 &&
+                                 g_captureKind.load(std::memory_order_relaxed) == CAP_SCHEMA_KEYCOMBO &&
+                                 g_capCfg == (void*)&cfg && g_capItem == (void*)&it;
+                if (capturing) {
+                    theme::PushCapturingStyle();
+                    ImGui::Button(i18n.T("capturing"), ImVec2(150.0f, 0.0f));
+                    theme::PopCapturingStyle();
+                } else if (ImGui::Button(kb, ImVec2(150.0f, 0.0f))) {
+                    g_capCfg = (void*)&cfg;
+                    g_capItem = (void*)&it;
+                    g_captureKind.store(CAP_SCHEMA_KEYCOMBO, std::memory_order_relaxed);
                     g_captureMode.store(1, std::memory_order_relaxed);
                 }
                 break;

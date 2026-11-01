@@ -64,6 +64,7 @@ bool GameWindow::Find() {
     }
     if (prev != GameWndProc) g_origProc = prev;  // keep original when already subclassed
     g_subclassedHwnd = hwnd;
+    g_gameHwnd.store((void*)hwnd, std::memory_order_relaxed);
     UpdateGeometry();
     Log("[gw] attached to game window %p (client %dx%d at %d,%d)", (void*)hwnd, w, h, x, y);
     return true;
@@ -76,6 +77,7 @@ void GameWindow::Detach() {
     g_origProc = nullptr;
     g_subclassedHwnd = nullptr;
     hwnd = nullptr;
+    g_gameHwnd.store(nullptr, std::memory_order_relaxed);
 }
 
 bool GameWindow::Valid() const {

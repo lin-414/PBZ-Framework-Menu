@@ -13,7 +13,9 @@
 #include "input.h"
 #include "menu.h"
 #include "layout.h"
+#include "registry.h"
 #include "schema.h"
+#include "textures.h"
 #include "theme.h"
 
 #include <d3d11.h>
@@ -75,6 +77,8 @@ struct Overlay {
     LARGE_INTEGER qpcLast{};
     LARGE_INTEGER diagNext{};           // 1 Hz input/present diagnostics while the menu is open
     float presentMaxMs = 0.0f;
+    bool gameWasFg = false;            // foreground edge detector for the reclaim watchdog
+    LARGE_INTEGER rawWatchNext{};      // periodic raw-input ownership check (4 Hz)
     std::vector<RAWINPUTDEVICE> rawList;   // game's raw-input registrations, saved on open
     bool rawListSaved = false;
 
@@ -157,6 +161,26 @@ void RestoreGameRawMouse() {
         if (!RegisterRawInputDevices(&rm, 1, sizeof(rm)))
             Log("[ov] raw mouse removal failed err=%lu", GetLastError());
     }
+}
+
+// True while the process-wide mouse raw-input entry still points at our
+// overlay. Never re-steal while it returns true: StealGameRawMouse saves the
+// list it sees as the restore state, and seeing our own entry there would
+// make close-time restore re-register OUR registration instead of the game's
+// (camera dead until restart, the exact failure the save/restore exists for).
+bool RawMouseIsOurs() {
+    // The NULL-buffer count query returns FALSE even when it fills n (probed
+    // 2026-11-01): ignore the return and trust n, mirroring StealGameRawMouse.
+    UINT n = 0;
+    GetRegisteredRawInputDevices(nullptr, &n, sizeof(RAWINPUTDEVICE));
+    std::vector<RAWINPUTDEVICE> list(n);
+    UINT got = n;
+    if (n > 0 && !GetRegisteredRawInputDevices(list.data(), &got, sizeof(RAWINPUTDEVICE))) return false;
+    for (const RAWINPUTDEVICE& d : list) {
+        if (d.usUsagePage == 0x01 && d.usUsage == 0x02)
+            return d.hwndTarget == g_ov.hwnd && (d.dwFlags & RIDEV_INPUTSINK) != 0;
+    }
+    return false;   // no mouse entry at all - ours is gone, steal again
 }
 
 // Full composited-desktop capture of the game window region: DWM hands us the
@@ -455,6 +479,7 @@ bool InitImGui() {
     }
 
     theme::ApplyPbzTheme(g_ov.cfg ? g_ov.cfg->uiOpacity : 0.94f);
+    theme::ApplyThemeByName(g_ov.cfg ? g_ov.cfg->theme : "ink");   // themes\<name>.json overrides
 
     g_ov.imguiReady = true;
     Log("[ov] ImGui ready (backend dx11, dynamic CJK fonts)");
@@ -471,6 +496,28 @@ void RenderFrame() {
     float dt = (float)((double)(now.QuadPart - g_ov.qpcLast.QuadPart) / (double)g_ov.qpcFreq.QuadPart);
     g_ov.qpcLast = now;
     dt = std::clamp(dt, 1.0f / 240.0f, 0.1f);
+
+    // Focus watchdog while the menu is open. Win/Alt-Tab away: the hooks pass
+    // input through (input.cpp GameHasForeground) and the steal keeps the
+    // camera frozen. Back on the game window: reclaim everything the
+    // re-activation can have taken - the game re-registers raw input (its
+    // camera then tracks the mouse with the menu open, in-game 2026-11-01),
+    // re-asserts its cursor clip, and its input stack can re-hook itself
+    // ahead of us in the LL chain. The 4 Hz poll covers re-registrations
+    // without an activation edge (Steam Input does this at any time).
+    bool gameFg = g_ov.gw->hwnd && GetForegroundWindow() == g_ov.gw->hwnd;
+    if (gameFg && !g_ov.gameWasFg) {
+        InputRehook();
+        g_ov.gw->UnclipCursor();
+        bool restolen = !RawMouseIsOurs();
+        if (restolen) StealGameRawMouse();
+        Log("[ov] game regained foreground - rehook + unclip%s", restolen ? " + raw re-steal" : "");
+    }
+    g_ov.gameWasFg = gameFg;
+    if (now.QuadPart >= g_ov.rawWatchNext.QuadPart) {
+        g_ov.rawWatchNext.QuadPart = now.QuadPart + g_ov.qpcFreq.QuadPart / 4;
+        if (!RawMouseIsOurs()) StealGameRawMouse();
+    }
 
     InputEvent ev;
     bool gotPos = false;
@@ -498,6 +545,13 @@ void RenderFrame() {
         io.AddMousePosEvent((float)p.x, (float)p.y);
     }
     g_ov.mousePosValid = true;
+
+    if (g_inputReset.exchange(0, std::memory_order_acq_rel)) {
+        // The passthrough borrow window let keys through to a capture tool;
+        // ImGui's idea of the keyboard is stale the moment isolation resumes
+        // (modifier-downs fed before the chord, mouse buttons clicked there).
+        io.ClearInputKeys();
+    }
 
     if (now.QuadPart >= g_ov.diagNext.QuadPart) {
         g_ov.diagNext.QuadPart = now.QuadPart + g_ov.qpcFreq.QuadPart;
@@ -528,6 +582,20 @@ void RenderFrame() {
             }
             g_capCfg = nullptr;
             g_capItem = nullptr;
+        } else if (kind == CAP_SCHEMA_KEYCOMBO) {
+            ConfigDef* c = (ConfigDef*)g_capCfg;
+            SchemaItem* it = (SchemaItem*)g_capItem;
+            if (c && it) {
+                unsigned mods = g_capturedMods.load(std::memory_order_acquire) & 0xFu;
+                it->ival = (long long)((captured & 0xFFu) | (mods << 8));
+                c->dirty = true;
+                SchemaSaveConfigNow(c);
+                c->FireChange(it->key.c_str());
+                Log("[ov] schema key combo captured: %s = %s", it->key.c_str(),
+                    Config::KeyModsToString(captured, mods).c_str());
+            }
+            g_capCfg = nullptr;
+            g_capItem = nullptr;
         } else {
             g_ov.cfg->toggleVk = captured;
             g_toggleVk.store(captured, std::memory_order_relaxed);
@@ -537,6 +605,7 @@ void RenderFrame() {
         g_captureKind.store(CAP_NONE, std::memory_order_relaxed);
     }
 
+    TexturesProcessPending();   // v2 texture uploads + dispose reaping
     ImGui_ImplDX11_NewFrame();
     ImGui::NewFrame();
 
@@ -617,6 +686,9 @@ void SetVisible(bool v) {
         g_ov.gw->UnclipCursor();
         StealGameRawMouse();
         g_ov.mousePosValid = false;
+        // Seed the edge detector so the first frame after open does not count
+        // as a "game regained foreground" transition.
+        g_ov.gameWasFg = g_ov.gw->hwnd && GetForegroundWindow() == g_ov.gw->hwnd;
         ImGui::GetIO().MouseDrawCursor = true;
         // The cursor sits over OUR overlay window, so its visibility follows
         // THIS thread's ShowCursor count - hiding it here never touches the
@@ -644,10 +716,12 @@ void SetVisible(bool v) {
         Log("[ov] menu closed (config saved)");
     }
     g_menuOpen.store(v, std::memory_order_release);
+    RegistryDispatchMenuEvent(v);   // v2 menu open/close listeners (render thread)
     if (v) InputRehook();   // jump our hooks to the LL chain front (see input.h)
 }
 
 void CleanupGraphics() {
+    TexturesShutdown();   // SRVs reference the device being torn down below
     if (g_ov.imguiReady) {
         ImGui_ImplDX11_Shutdown();
         ImGui::DestroyContext();
@@ -730,6 +804,10 @@ DWORD WINAPI RenderThread(LPVOID) {
 }
 
 } // namespace
+
+ID3D11Device* OverlayDevice() {
+    return g_ov.dev.Get();
+}
 
 bool OverlayStart(GameWindow* gw, Config* cfg, I18n* i18n, const std::wstring& iniPath) {
     g_ov.gw = gw;

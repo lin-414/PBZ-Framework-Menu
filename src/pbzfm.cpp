@@ -27,13 +27,19 @@ std::atomic<UINT> g_toggleVk{ VK_F8 };
 std::atomic<int>  g_captureMode{ 0 };
 std::atomic<int>  g_captureKind{ 0 };
 std::atomic<UINT> g_capturedVk{ 0 };
+std::atomic<unsigned> g_capturedMods{ 0 };
 std::atomic<int>  g_btnCliX{ -1 };
 std::atomic<int>  g_btnCliY{ -1 };
 std::atomic<int>  g_btnScrX{ -1 };
 std::atomic<int>  g_btnScrY{ -1 };
 std::atomic<int>  g_hookMoves{ 0 };
+std::atomic<void*> g_gameHwnd{ nullptr };
+std::atomic<int>  g_inputReset{ 0 };
 
-const char* const kVersion = "0.3.2";
+#ifndef PBZFM_VERSION_STR
+#define PBZFM_VERSION_STR "0.4.0"
+#endif
+const char* const kVersion = PBZFM_VERSION_STR;
 
 namespace {
 
@@ -94,6 +100,9 @@ DWORD WINAPI InitThreadProc(LPVOID) {
         Log("config not found, defaults in use (%ls is written on save)", iniPath.c_str());
     }
     g_toggleVk.store(g_cfg.toggleVk, std::memory_order_relaxed);
+    // Published before InputStart: the hook thread reads the chord list from
+    // then on (the SRWLock in input.cpp keeps a future live reconfigure safe).
+    InputSetPassthrough(g_cfg.passthroughKeys, g_cfg.passthroughReplay);
     g_i18n.Load(ModRoot() + L"\\languages", Utf8ToWide(g_cfg.language));
 
     if (!OverlayStart(&g_gw, &g_cfg, &g_i18n, iniPath)) {
@@ -209,8 +218,6 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
 
 extern "C" {
 
-__declspec(dllexport) const char* PBZFM_Version() { return pbzfm::kVersion; }
-
 __declspec(dllexport) void PBZFM_Shutdown() { pbzfm::RequestShutdown(); }
 
 // Test hook: current screen position of the demo button (host clicks here).
@@ -251,7 +258,19 @@ __declspec(dllexport) void PBZFM_TestToggleMenu(bool open) {
 // Mirrors what the keyboard hook does for a closed-menu key (registry
 // hotkeys fire on down edges).
 __declspec(dllexport) bool PBZFM_TestDispatchHotkey(unsigned vk) {
-    return pbzfm::RegistryDispatchHotkey(vk, false);
+    return pbzfm::RegistryDispatchHotkey(vk, false, 0);
+}
+
+// Test probe: is the screenshot-tool passthrough borrow window open right now?
+__declspec(dllexport) int PBZFM_TestPassthroughActive() {
+    return pbzfm::InputPassthroughActive() ? 1 : 0;
+}
+
+// Test hook: replace the passthrough chord list with a single chord so the
+// host scenario never pops a live PixPin/NVIDIA capture overlay.
+__declspec(dllexport) void PBZFM_TestSetPassthrough(unsigned vk, bool ctrl, bool shift, bool alt, bool win, bool replay) {
+    std::vector<pbzfm::HotkeyChord> chords{ pbzfm::HotkeyChord{ vk, ctrl, shift, alt, win } };
+    pbzfm::InputSetPassthrough(chords, replay);
 }
 
 // UE4SS C++ mod lifecycle contract (CppMod.cpp requires both exports; without

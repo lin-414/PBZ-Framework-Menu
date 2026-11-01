@@ -72,9 +72,12 @@ bool Config::Load(const std::wstring& path) {
         if (section == L"framework") {
             if (k == "language") language = WideToUtf8(val);
             else if (k == "toggle_key") { UINT vk = VkFromName(val); if (vk) toggleVk = vk; }
+            else if (k == "passthrough_keys") passthroughKeys = ChordsFromText(val);
+            else if (k == "passthrough_replay") passthroughReplay = (val == L"1" || _wcsicmp(val.c_str(), L"true") == 0);
         } else if (section == L"ui") {
             if (k == "ui_scale") uiScale = (float)_wtof(val.c_str());
             else if (k == "ui_opacity") uiOpacity = (float)_wtof(val.c_str());
+            else if (k == "theme") theme = WideToUtf8(val);
         } else if (section == L"demo") {
             if (k == "fov") fov = (float)_wtof(val.c_str());
             else if (k == "freeze") freeze = (val == L"1" || _wcsicmp(val.c_str(), L"true") == 0);
@@ -96,14 +99,77 @@ bool Config::Save(const std::wstring& path) const {
     out += "language = " + language + "\n";
     snprintf(buf, sizeof(buf), "toggle_key = %s\n", VkName(toggleVk));
     out += buf;
+    std::string chords;
+    for (size_t i = 0; i < passthroughKeys.size(); ++i) {
+        if (i) chords += ", ";
+        chords += ChordToString(passthroughKeys[i]);
+    }
+    out += "passthrough_keys = " + chords + "\n";
+    snprintf(buf, sizeof(buf), "passthrough_replay = %s\n", passthroughReplay ? "true" : "false");
+    out += buf;
     out += "\n[ui]\n";
     snprintf(buf, sizeof(buf), "ui_scale = %.2f\nui_opacity = %.2f\n", uiScale, uiOpacity);
     out += buf;
+    out += "theme = " + theme + "\n";
     out += "\n[demo]\n";
     snprintf(buf, sizeof(buf), "fov = %.1f\nfreeze = %s\nquality = %d\ndemo_clicks = %ld\n",
              fov, freeze ? "true" : "false", quality, clicks);
     out += buf;
     return WriteFileText(path, out);
+}
+
+// "Alt+P, Alt+F1" -> two chords. Tokens are matched case-insensitively; an
+// unknown key name or a second non-modifier token drops the whole chord.
+std::vector<HotkeyChord> Config::ChordsFromText(const std::wstring& csv) {
+    std::vector<HotkeyChord> out;
+    size_t pos = 0;
+    while (pos <= csv.size()) {
+        size_t comma = csv.find(L',', pos);
+        if (comma == std::wstring::npos) comma = csv.size();
+        std::wstring item = Trim(csv.substr(pos, comma - pos));
+        pos = comma + 1;
+        if (item.empty()) continue;
+        HotkeyChord c{};
+        bool haveVk = false, valid = true;
+        size_t start = 0;
+        while (start <= item.size()) {
+            size_t plus = item.find(L'+', start);
+            std::wstring tok = Trim(item.substr(start, plus == std::wstring::npos ? std::wstring::npos : plus - start));
+            if (_wcsicmp(tok.c_str(), L"ctrl") == 0 || _wcsicmp(tok.c_str(), L"control") == 0) c.ctrl = true;
+            else if (_wcsicmp(tok.c_str(), L"shift") == 0) c.shift = true;
+            else if (_wcsicmp(tok.c_str(), L"alt") == 0) c.alt = true;
+            else if (_wcsicmp(tok.c_str(), L"win") == 0) c.win = true;
+            else if (!haveVk) {
+                c.vk = VkFromName(tok);
+                haveVk = true;
+                if (!c.vk) { valid = false; break; }
+            } else { valid = false; break; }
+            if (plus == std::wstring::npos) break;
+            start = plus + 1;
+        }
+        if (valid && haveVk && c.vk) out.push_back(c);
+    }
+    return out;
+}
+
+std::string Config::ChordToString(const HotkeyChord& c) {
+    std::string s;
+    if (c.ctrl) s += "Ctrl+";
+    if (c.shift) s += "Shift+";
+    if (c.alt) s += "Alt+";
+    if (c.win) s += "Win+";
+    s += VkName(c.vk);
+    return s;
+}
+
+std::string Config::KeyModsToString(unsigned vk, unsigned mods) {
+    HotkeyChord c{};
+    c.vk = vk;
+    c.ctrl = (mods & 0x1u) != 0;
+    c.shift = (mods & 0x2u) != 0;
+    c.alt = (mods & 0x4u) != 0;
+    c.win = (mods & 0x8u) != 0;
+    return ChordToString(c);
 }
 
 const char* Config::VkName(UINT vk) {

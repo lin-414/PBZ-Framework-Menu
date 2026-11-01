@@ -12,6 +12,9 @@
 
 #include <imgui.h>
 #include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
 
 namespace pbzfm {
 
@@ -23,6 +26,23 @@ Config* s_cfg = nullptr;
 I18n* s_i18n = nullptr;
 MenuUi* s_ui = nullptr;
 bool s_frameworkRegistered = false;
+
+// ASCII case-insensitive substring; non-ASCII UTF-8 bytes compare as-is, so
+// CJK names filter by exact byte prefix too.
+bool SidebarFilterMatch(const char* hay, const char* needle) {
+    if (!needle || !*needle) return true;
+    if (!hay) return false;
+    auto fold = [](char c) { return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c; };
+    const size_t nlen = strlen(needle);
+    const size_t hlen = strlen(hay);
+    if (nlen > hlen) return false;
+    for (size_t i = 0; i + nlen <= hlen; ++i) {
+        size_t j = 0;
+        while (j < nlen && fold(hay[i + j]) == fold(needle[j])) ++j;
+        if (j == nlen) return true;
+    }
+    return false;
+}
 
 void FrameworkSettingsPage(void*) {
     Config& cfg = *s_cfg;
@@ -48,6 +68,26 @@ void FrameworkSettingsPage(void*) {
     }
     ImGui::SliderFloat(i18n.T("ui_scale"), &cfg.uiScale, 0.7f, 1.8f, "%.2fx");
     ImGui::SliderFloat(i18n.T("ui_opacity"), &cfg.uiOpacity, 0.4f, 1.0f);
+
+    {
+        // Theme picker: "ink" is the built-in 玄墨鎏金, anything else is a
+        // themes\<name>.json over the built-in style (layout paddings stay
+        // fixed for the host automation).
+        std::vector<std::string> names = theme::ListThemeNames();
+        std::string cur = cfg.theme == "ink" ? i18n.T("theme_builtin") : cfg.theme;
+        if (ImGui::BeginCombo(i18n.T("theme"), cur.c_str())) {
+            for (const std::string& n : names) {
+                std::string label = (n == "ink") ? i18n.T("theme_builtin") : n;
+                bool sel = cfg.theme == n;
+                if (ImGui::Selectable(label.c_str(), sel) && !sel) {
+                    cfg.theme = n;
+                    theme::ApplyThemeByName(n);
+                    ui.requestSave = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+    }
 
     ImGui::Separator();
 
@@ -77,6 +117,19 @@ void FrameworkSettingsPage(void*) {
     if (ui.shotFlash > 0.0f) {
         ImGui::SameLine();
         ImGui::TextDisabled("%s", i18n.T("shot_saved"));
+    }
+
+    // Passthrough status: what the ini lets through to screenshot tools while
+    // the menu owns the input (configured in PBZFM.ini, read at load time).
+    {
+        std::string chords;
+        for (size_t i = 0; i < cfg.passthroughKeys.size(); ++i) {
+            if (i) chords += ", ";
+            chords += Config::ChordToString(cfg.passthroughKeys[i]);
+        }
+        ImGui::TextDisabled("%s: %s", i18n.T("passthrough"),
+                            chords.empty() ? "-" : chords.c_str());
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", i18n.T("passthrough_hint"));
     }
 
     ImGui::Separator();
@@ -223,8 +276,19 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
 
     ImGui::BeginChild("##sections", ImVec2(190.0f, -footBand));
     RegistryResetSectionRects();
+    // Sidebar search: filters sections by (translated or raw) name substring;
+    // the current selection stays put even when filtered out.
+    static char search[64] = "";
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##search", i18n.T("search_hint"), search, sizeof(search));
+    int shownSections = 0;
     for (int i = 0; i < (int)sections.size(); ++i) {
         if (sections[i].get() == fw) continue;   // reached through the corner button
+        if (!SidebarFilterMatch(i18n.T(sections[i]->name.c_str()), search) &&
+            !SidebarFilterMatch(sections[i]->name.c_str(), search)) {
+            continue;
+        }
+        ++shownSections;
         const bool sel = selSection == i;
         if (sel) ImGui::PushStyleColor(ImGuiCol_Text, theme::kGoldBright);
         if (ImGui::Selectable(i18n.T(sections[i]->name.c_str()), sel)) {
@@ -241,6 +305,9 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
         }
         float rect[4] = { ra.x, ra.y, rb.x, rb.y };
         RegistryRecordSectionRect(i, rect);
+    }
+    if (shownSections == 0) {
+        ImGui::TextDisabled("-");
     }
     ImGui::EndChild();
     if (!s_frameworkRegistered) {

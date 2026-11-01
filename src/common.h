@@ -20,12 +20,16 @@ extern std::atomic<bool> g_closeRequest; // menu ui -> render thread: close menu
 extern std::atomic<UINT> g_toggleVk;     // current toggle virtual-key (hook reads)
 extern std::atomic<int>  g_captureMode;  // 0 = none, 1 = waiting for a new key
 extern std::atomic<UINT> g_capturedVk;   // capture result (0 = none)
+extern std::atomic<unsigned> g_capturedMods; // PBZFM_MOD_* bits held at capture completion
 extern std::atomic<int>  g_captureKind;  // CaptureKind in schema.h (0 none, 1 toggle, 2 schema key)
 extern std::atomic<int>  g_btnCliX;      // demo button rect, overlay client coords
 extern std::atomic<int>  g_btnCliY;      // (menu.cpp writes, overlay converts to screen)
 extern std::atomic<int>  g_btnScrX;      // demo button center, screen coords (-1 = unknown)
 extern std::atomic<int>  g_btnScrY;
 extern std::atomic<int>  g_hookMoves;    // real mouse moves seen by the hook while menu open (diagnostic)
+extern std::atomic<void*> g_gameHwnd;    // game window handle; the hook's passthrough borrow window
+                                         // ends when the foreground returns to this window
+extern std::atomic<int>  g_inputReset;   // hook -> render thread: ImGui input state went stale (passthrough)
 
 extern const char* const kVersion;
 

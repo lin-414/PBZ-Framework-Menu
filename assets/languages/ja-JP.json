@@ -4,6 +4,8 @@
   "page_settings": "設定",
   "screenshot": "スクリーンショット",
   "shot_saved": "Screenshots フォルダに保存しました",
+  "passthrough": "スクショツール直通キー",
+  "passthrough_hint": "メニュー表示中にこのキーを押すと、1回目で入力借用が開き(見た目は変わりません)、2回目で PixPin/NVIDIA にキーが届き通常どおりキャプチャできます(カメラは凍結のまま)。PBZFM.ini [framework] passthrough_keys でカンマ区切りで指定(例: Ctrl+P, Alt+F1)",
   "hint": "独立した DirectComposition オーバーレイ",
   "btn_test": "テストボタン",
   "count": "クリック数",
@@ -24,5 +26,9 @@
   "capturing": "新しいキーを押してください…",
   "save": "設定を保存",
   "close_menu": "メニューを閉じる (Esc)",
-  "saved": "PBZFM.ini に保存しました"
+  "saved": "PBZFM.ini に保存しました",
+  "search": "検索",
+  "search_hint": "入力してモッドを絞り込む…",
+  "theme": "テーマ",
+  "theme_builtin": "玄墨鎏金"
 }

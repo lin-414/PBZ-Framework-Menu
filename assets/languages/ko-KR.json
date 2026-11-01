@@ -4,6 +4,8 @@
   "page_settings": "설정",
   "screenshot": "화면 캡처",
   "shot_saved": "Screenshots 폴더에 저장했습니다",
+  "passthrough": "스크린샷 도구 직통 키",
+  "passthrough_hint": "메뉴가 열려 있는 동안 이 키를 누르면 첫 입력으로 입력 빌려쓰기가 열리고(화면 변화 없음), 두 번째 입력이 PixPin/NVIDIA 에 전달되어 정상 캡처됩니다(카메라는 정지 유지). PBZFM.ini [framework] passthrough_keys 에 쉼표로 구분해 지정(예: Ctrl+P, Alt+F1)",
   "hint": "독립 실행형 DirectComposition 오버레이",
   "btn_test": "테스트 버튼",
   "count": "클릭 수",
@@ -24,5 +26,9 @@
   "capturing": "새 키를 누르세요...",
   "save": "설정 저장",
   "close_menu": "메뉴 닫기 (Esc)",
-  "saved": "PBZFM.ini에 저장했습니다"
+  "saved": "PBZFM.ini에 저장했습니다",
+  "search": "검색",
+  "search_hint": "입력하여 모드 필터링...",
+  "theme": "테마",
+  "theme_builtin": "먹과 금"
 }

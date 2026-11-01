@@ -3,6 +3,7 @@
 #include "registry.h"
 #include <imgui.h>
 #include <mutex>
+#include <set>
 #include <deque>
 
 namespace pbzfm {
@@ -44,6 +45,9 @@ bool g_toggleWasDown = false;
 // Thread message: unhook + rehook, making our hooks the newest (first run)
 // in the LL chain again. Posted from the render thread on menu open.
 constexpr UINT WM_APP_PBZFM_REHOOK = WM_APP + 0x26;
+// Thread message: send the pending synthetic chord. Posted from KbProc -
+// SendInput from inside a hook callback would re-enter the hook chain.
+constexpr UINT WM_APP_PBZFM_REPLAY = WM_APP + 0x27;
 
 LRESULT CALLBACK KbProc(int code, WPARAM w, LPARAM l);
 LRESULT CALLBACK MouseProc(int code, WPARAM w, LPARAM l);
@@ -61,6 +65,132 @@ struct MoveTrack {
     LONG trackX = 0, trackY = 0;  // would-be cursor position for ImGui
 };
 MoveTrack g_moveTrack;
+
+// ---- screenshot-tool passthrough (see input.h) ----
+// Hook-thread state. g_ptChords/g_ptReplay are published via
+// InputSetPassthrough (currently once, before the hooks start; the SRWLOCK
+// keeps a future live reconfigure race-free). The rest lives only on the
+// hook thread - both hooks run there.
+constexpr DWORD kPtGraceMs = 1000;   // instant captures never switch foreground
+constexpr DWORD kPtFgPumpMs = 15;    // foreground polling rate; a poll per event is waste
+
+SRWLOCK g_ptLock = SRWLOCK_INIT;
+std::vector<HotkeyChord> g_ptChords;
+bool g_ptReplay = false;
+std::atomic<bool> g_ptActive{ false };
+DWORD g_ptStartTick = 0;
+DWORD g_ptFgPumpTick = 0;
+bool g_ptSawOtherFg = false;
+bool g_ptOnGame = true;    // pumped foreground snapshot: game window owns the foreground
+HotkeyChord g_ptPendingReplay{};
+std::set<unsigned> g_ptDownKeys;   // keys passed DOWN during the borrow window
+
+int PtAsync(UINT vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0 ? 1 : 0; }
+
+// Modifier state as seen by this hook. GetAsyncKeyState does not reflect keys
+// the LL chain swallowed (verified 2026-11-01: Ctrl+Alt swallowed right before
+// the final key, async state still reports all-up) - and the menu-open swallow
+// eats exactly the modifiers a chord needs, so the match runs on our own
+// bookkeeping instead.
+unsigned g_ptMods = 0;   // bit0 ctrl, bit1 shift, bit2 alt, bit3 win (hook thread only)
+
+void PtTrackMods(UINT vk, bool down) {
+    unsigned bit;
+    switch (vk) {
+        case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL: bit = 1u << 0; break;
+        case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT: bit = 1u << 1; break;
+        case VK_MENU: case VK_LMENU: case VK_RMENU: bit = 1u << 2; break;
+        case VK_LWIN: case VK_RWIN: bit = 1u << 3; break;
+        default: return;
+    }
+    if (down) g_ptMods |= bit; else g_ptMods &= ~bit;
+}
+
+unsigned PtAsyncMods() {
+    unsigned m = 0;
+    if (PtAsync(VK_CONTROL) || PtAsync(VK_LCONTROL) || PtAsync(VK_RCONTROL)) m |= 1u;
+    if (PtAsync(VK_SHIFT) || PtAsync(VK_LSHIFT) || PtAsync(VK_RSHIFT)) m |= 2u;
+    if (PtAsync(VK_MENU) || PtAsync(VK_LMENU) || PtAsync(VK_RMENU)) m |= 4u;
+    if (PtAsync(VK_LWIN) || PtAsync(VK_RWIN)) m |= 8u;
+    return m;
+}
+
+// Strict modifier match: a held extra Shift does not trigger an Alt+P chord.
+bool PtModsMatch(const HotkeyChord& c) {
+    bool ctrl = g_ptMods & 1u, shift = g_ptMods & 2u, alt = g_ptMods & 4u, win = g_ptMods & 8u;
+    return c.ctrl == ctrl && c.shift == shift && c.alt == alt && c.win == win;
+}
+
+void PtEnter() {
+    g_ptActive.store(true, std::memory_order_relaxed);
+    g_ptStartTick = GetTickCount();
+    g_ptFgPumpTick = 0;
+    g_ptSawOtherFg = false;
+    g_ptDownKeys.clear();
+    g_moveTrack.valid = false;
+}
+
+void PtClose(const char* why) {
+    g_ptActive.store(false, std::memory_order_relaxed);
+    g_ptDownKeys.clear();
+    g_moveTrack.valid = false;
+    g_inputReset.store(1, std::memory_order_release);
+    Log("[input] passthrough closed (%s)", why);
+}
+
+// Throttled foreground snapshot shared by both hooks (same thread). Returns
+// true while the game window owns the foreground; g_ptSawOtherFg records
+// "the user left the game at least once" for the borrow window's auto-close.
+bool PtPump() {
+    DWORD now = GetTickCount();
+    if (now - g_ptFgPumpTick >= kPtFgPumpMs) {
+        g_ptFgPumpTick = now;
+        HWND game = (HWND)g_gameHwnd.load(std::memory_order_relaxed);
+        HWND fg = GetForegroundWindow();
+        bool nowOn = (!fg || fg == game);
+        if (nowOn != g_ptOnGame)
+            Log("[input] foreground %s game (fg=%p game=%p)", nowOn ? "on" : "off", (void*)fg, (void*)game);
+        g_ptOnGame = nowOn;
+        if (!g_ptOnGame) g_ptSawOtherFg = true;
+    }
+    return g_ptOnGame;
+}
+
+// Borrow window auto-close: the foreground came back to the game after the
+// tool had it (capture finished/cancelled), or the grace window expired while
+// the foreground never left the game (instant captures like NVIDIA's
+// screenshot key do not open a window).
+bool PtBorrowShouldClose() {
+    PtPump();
+    return g_ptOnGame && (g_ptSawOtherFg || GetTickCount() - g_ptStartTick >= kPtGraceMs);
+}
+
+// SendInput from inside a hook callback would re-enter the hook chain, so the
+// replay is deferred to the hook thread's message loop.
+void PtSendReplay() {
+    const HotkeyChord& c = g_ptPendingReplay;
+    if (!c.vk) return;
+    INPUT in[10]{};
+    int n = 0;
+    auto key = [&](WORD vk, bool up) {
+        in[n].type = INPUT_KEYBOARD;
+        in[n].ki.wVk = vk;
+        in[n].ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
+        ++n;
+    };
+    if (c.ctrl) key(VK_CONTROL, false);
+    if (c.shift) key(VK_SHIFT, false);
+    if (c.alt) key(VK_MENU, false);
+    if (c.win) key(VK_LWIN, false);
+    key((WORD)c.vk, false);
+    key((WORD)c.vk, true);
+    if (c.win) key(VK_LWIN, true);
+    if (c.alt) key(VK_MENU, true);
+    if (c.shift) key(VK_SHIFT, true);
+    if (c.ctrl) key(VK_CONTROL, true);
+    SendInput(n, in, sizeof(INPUT));
+    Log("[input] passthrough replayed the chord synthetically (%d events)", n);
+}
 
 void RehookNow() {
     if (g_kbHook) UnhookWindowsHookEx(g_kbHook);
@@ -132,18 +262,31 @@ LRESULT CALLBACK KbProc(int code, WPARAM w, LPARAM l) {
     UINT vk = s->vkCode;
     bool up = (s->flags & LLKHF_UP) != 0;
 
+    PtTrackMods(vk, !up);   // chord matcher state; must run before any early-out
+
     if (vk == VK_LWIN || vk == VK_RWIN) return CallNextHookEx(g_kbHook, code, w, l);
 
-    // Key capture flow: first non-modifier key becomes the new toggle key.
+    // Key capture flow: first non-modifier key completes the capture; the
+    // tracked modifier state at that moment rides along (v2 chord captures
+    // use it, single-key captures ignore it).
     if (g_captureMode.load(std::memory_order_relaxed) == 1) {
         if (!up && !IsModifier(vk)) {
             g_capturedVk.store(vk, std::memory_order_release);
+            g_capturedMods.store(g_ptMods & 0xFu, std::memory_order_release);
             g_captureMode.store(0, std::memory_order_relaxed);
         }
         return 1;  // never let capture strokes reach the game
     }
 
+    // Menu-open edge: fold in the modifiers held before the open (they were
+    // passed while closed, so the async state is accurate for them).
+    static bool ptWasOpen = false;
+    bool menuOpenNow = g_menuOpen.load(std::memory_order_relaxed);
+    if (menuOpenNow && !ptWasOpen) g_ptMods |= PtAsyncMods();
+    ptWasOpen = menuOpenNow;
+
     if (vk == g_toggleVk.load(std::memory_order_relaxed)) {
+        if (g_ptActive.load(std::memory_order_relaxed)) PtClose("menu toggled");
         if (!up && !g_toggleWasDown) g_wantToggle.store(true, std::memory_order_release);
         g_toggleWasDown = !up;
         if (g_menuOpen.load(std::memory_order_relaxed)) return 1;
@@ -151,20 +294,92 @@ LRESULT CALLBACK KbProc(int code, WPARAM w, LPARAM l) {
     }
 
     if (!g_menuOpen.load(std::memory_order_relaxed)) {
+        if (g_ptActive.load(std::memory_order_relaxed)) PtClose("menu closed");
         // Registered mod hotkeys fire while the menu is closed; when one
         // matches, the key is swallowed before the game sees it.
-        if (RegistryDispatchHotkey(vk, up)) return 1;
+        if (RegistryDispatchHotkey(vk, up, g_ptMods)) return 1;
         return CallNextHookEx(g_kbHook, code, w, l);
     }
 
-    // Menu open: swallow everything except Alt+Tab so the user can escape.
+    // Menu open. The swallow only applies while the game window owns the
+    // foreground - Win / Alt-Tab / clicking another app must leave the shell's
+    // own keyboard working (the overlay's watchdog reclaims hooks and raw
+    // input when the game comes back). Esc still closes the menu from there.
     if (vk == VK_TAB && (GetAsyncKeyState(VK_MENU) & 0x8000))
         return CallNextHookEx(g_kbHook, code, w, l);
+
+    PtPump();
+    if (!g_ptOnGame) {
+        if (vk == VK_ESCAPE) {
+            int ik = VkToImGuiKey(vk);
+            if (ik != ImGuiKey_None) {
+                InputEvent e{};
+                e.type = InputEvent::Key;
+                e.key = ik;
+                e.down = !up;
+                Push(e);
+            }
+            return 1;
+        }
+        return CallNextHookEx(g_kbHook, code, w, l);
+    }
+
+    // Screenshot-tool passthrough: a configured chord opens the borrow window
+    // instead of feeding the menu. While it is open every key goes through so
+    // PixPin/NVIDIA capture overlays keep working; the game camera stays
+    // frozen because the game's raw mouse input still points at the overlay.
+    if (!up && !IsModifier(vk)) {
+        HotkeyChord hit{};
+        bool matched = false, replay = false;
+        AcquireSRWLockShared(&g_ptLock);
+        for (const HotkeyChord& c : g_ptChords) {
+            if (c.vk != vk) continue;
+            if (PtModsMatch(c)) {
+                hit = c;
+                matched = true;
+                replay = g_ptReplay;
+                break;
+            }
+            if (!g_ptActive.load(std::memory_order_relaxed))
+                Log("[input] chord vk hit, mods mismatch (want %s: tracked ctrl=%d shift=%d alt=%d win=%d)",
+                    Config::ChordToString(c).c_str(),
+                    (g_ptMods & 1u) ? 1 : 0, (g_ptMods & 2u) ? 1 : 0, (g_ptMods & 4u) ? 1 : 0, (g_ptMods & 8u) ? 1 : 0);
+        }
+        ReleaseSRWLockShared(&g_ptLock);
+        if (matched && !g_ptActive.load(std::memory_order_relaxed)) {
+            PtEnter();
+            std::string nm = Config::ChordToString(hit);
+            if (replay) {
+                // Hook-based tools never saw the swallowed modifier-down, so
+                // replay the whole chord synthetically; the injected events
+                // come back through the active branch below.
+                g_ptPendingReplay = hit;
+                PostThreadMessageW(g_hookThreadId, WM_APP_PBZFM_REPLAY, 0, 0);
+                Log("[input] passthrough entered: %s (replayed)", nm.c_str());
+                return 1;
+            }
+            g_ptDownKeys.insert(vk);
+            Log("[input] passthrough entered: %s", nm.c_str());
+            return CallNextHookEx(g_kbHook, code, w, l);
+        }
+    }
+
+    if (g_ptActive.load(std::memory_order_relaxed)) {
+        if (PtBorrowShouldClose()) {
+            bool letThrough = up && g_ptDownKeys.count(vk) != 0;
+            PtClose("foreground back on the game");
+            if (letThrough) return CallNextHookEx(g_kbHook, code, w, l);  // never strand a passed key
+            return 1;
+        }
+        if (up) g_ptDownKeys.erase(vk);
+        else g_ptDownKeys.insert(vk);
+        return CallNextHookEx(g_kbHook, code, w, l);
+    }
 
     // Registered mod hotkeys stay live while the menu is open (screenshot /
     // photo-mode toggles are meta-features, not game input). A dispatched key
     // is swallowed and does not reach the menu widgets either.
-    if (RegistryDispatchHotkey(vk, up)) return 1;
+    if (RegistryDispatchHotkey(vk, up, g_ptMods)) return 1;
 
     int ik = VkToImGuiKey(vk);
     if (ik != ImGuiKey_None) {
@@ -184,6 +399,22 @@ LRESULT CALLBACK MouseProc(int code, WPARAM w, LPARAM l) {
         return CallNextHookEx(g_mouseHook, code, w, l);
     }
     MSLLHOOKSTRUCT* s = (MSLLHOOKSTRUCT*)l;
+    // Away from the game: the shell owns the mouse as well; rebase motion
+    // tracking so the menu cursor jumps cleanly on return.
+    PtPump();
+    if (!g_ptOnGame) {
+        g_moveTrack.valid = false;
+        return CallNextHookEx(g_mouseHook, code, w, l);
+    }
+    // Passthrough borrow window: everything goes to the capture tool; when
+    // the foreground is back on the game, resume isolation with this event.
+    if (g_ptActive.load(std::memory_order_relaxed)) {
+        if (PtBorrowShouldClose()) {
+            PtClose("foreground back on the game");
+            return 1;
+        }
+        return CallNextHookEx(g_mouseHook, code, w, l);
+    }
     InputEvent e{};
     switch (w) {
         case WM_LBUTTONDOWN: case WM_LBUTTONUP:
@@ -235,6 +466,7 @@ DWORD WINAPI HookThread(LPVOID) {
     MSG msg;
     while (g_running.load(std::memory_order_relaxed) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (msg.message == WM_APP_PBZFM_REHOOK) { RehookNow(); continue; }
+        if (msg.message == WM_APP_PBZFM_REPLAY) { PtSendReplay(); continue; }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -272,7 +504,22 @@ bool InputPop(InputEvent* out) {
 
 void InputPushEvent(const InputEvent& e) { Push(e); }
 
+void InputSetPassthrough(const std::vector<HotkeyChord>& chords, bool replay) {
+    {
+        AcquireSRWLockExclusive(&g_ptLock);
+        g_ptChords = chords;
+        g_ptReplay = replay;
+        ReleaseSRWLockExclusive(&g_ptLock);
+    }
+    std::string names;
+    for (size_t i = 0; i < chords.size(); ++i) {
+        if (i) names += ", ";
+        names += Config::ChordToString(chords[i]);
+    }
+    Log("[input] passthrough chords: %s (replay=%d)", names.empty() ? "(none)" : names.c_str(), (int)replay);
+}
 
+bool InputPassthroughActive() { return g_ptActive.load(std::memory_order_relaxed); }
 
 void InputRehook() {
     if (g_hookThreadId) PostThreadMessageW(g_hookThreadId, WM_APP_PBZFM_REHOOK, 0, 0);

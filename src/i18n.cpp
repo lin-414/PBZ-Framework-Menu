@@ -30,9 +30,15 @@ R"json({
   "capturing": "按下新按键…",
   "screenshot": "截取屏幕",
   "shot_saved": "已保存到 Screenshots 文件夹",
+  "passthrough": "截图直通热键",
+  "passthrough_hint": "菜单打开期间按下这些键:第一次开启输入借用(画面不变属正常),再按一次同样的键,PixPin/N卡 即正常截图(期间镜头保持冻结),回到游戏后自动恢复。在 PBZFM.ini [framework] passthrough_keys 配置,逗号分隔,如 Ctrl+P, Alt+F1",
   "save": "保存配置",
   "close_menu": "关闭菜单 (Esc)",
-  "saved": "已保存到 PBZFM.ini"
+  "saved": "已保存到 PBZFM.ini",
+  "search": "搜索",
+  "search_hint": "输入以筛选模组…",
+  "theme": "主题",
+  "theme_builtin": "玄墨鎏金"
 })json";
 
 static const char* kJsonEn =
@@ -60,9 +66,15 @@ R"json({
   "capturing": "Press a new key...",
   "screenshot": "Capture screen",
   "shot_saved": "Saved to the Screenshots folder",
+  "passthrough": "Screenshot-tool passthrough",
+  "passthrough_hint": "While the menu is open, the first press of these chords opens an input borrow (no visual change is normal) and the SECOND press reaches PixPin/NVIDIA for real (the camera stays frozen); isolation resumes when you return to the game. Configure passthrough_keys in PBZFM.ini [framework], comma-separated, e.g. Ctrl+P, Alt+F1",
   "save": "Save settings",
   "close_menu": "Close menu (Esc)",
-  "saved": "Saved to PBZFM.ini"
+  "saved": "Saved to PBZFM.ini",
+  "search": "Search",
+  "search_hint": "Type to filter mods...",
+  "theme": "Theme",
+  "theme_builtin": "Ink & Gold"
 })json";
 
 static const char* kJsonJp =
@@ -90,9 +102,15 @@ R"json({
   "capturing": "新しいキーを押してください…",
   "screenshot": "スクリーンショット",
   "shot_saved": "Screenshots フォルダに保存しました",
+  "passthrough": "スクショツール直通キー",
+  "passthrough_hint": "メニュー表示中にこのキーを押すと、1回目で入力借用が開き(見た目は変わりません)、2回目で PixPin/NVIDIA にキーが届き通常どおりキャプチャできます(カメラは凍結のまま)。PBZFM.ini [framework] passthrough_keys でカンマ区切りで指定(例: Ctrl+P, Alt+F1)",
   "save": "設定を保存",
   "close_menu": "メニューを閉じる (Esc)",
-  "saved": "PBZFM.ini に保存しました"
+  "saved": "PBZFM.ini に保存しました",
+  "search": "検索",
+  "search_hint": "入力してモッドを絞り込む…",
+  "theme": "テーマ",
+  "theme_builtin": "玄墨鎏金"
 })json";
 
 static const char* kJsonKr =
@@ -120,9 +138,15 @@ R"json({
   "capturing": "새 키를 누르세요...",
   "screenshot": "화면 캡처",
   "shot_saved": "Screenshots 폴더에 저장했습니다",
+  "passthrough": "스크린샷 도구 직통 키",
+  "passthrough_hint": "메뉴가 열려 있는 동안 이 키를 누르면 첫 입력으로 입력 빌려쓰기가 열리고(화면 변화 없음), 두 번째 입력이 PixPin/NVIDIA 에 전달되어 정상 캡처됩니다(카메라는 정지 유지). PBZFM.ini [framework] passthrough_keys 에 쉼표로 구분해 지정(예: Ctrl+P, Alt+F1)",
   "save": "설정 저장",
   "close_menu": "메뉴 닫기 (Esc)",
-  "saved": "PBZFM.ini에 저장했습니다"
+  "saved": "PBZFM.ini에 저장했습니다",
+  "search": "검색",
+  "search_hint": "입력하여 모드 필터링...",
+  "theme": "테마",
+  "theme_builtin": "먹과 금"
 })json";
 
 static std::wstring Utf8ToWide(const std::string& u) {
