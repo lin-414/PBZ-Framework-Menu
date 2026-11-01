@@ -99,16 +99,38 @@ void RenderTreeNode(Section& node, int depth, TreeCtx& tc) {
     const bool sel = !*tc.selSettings && *tc.selPath == path;
 
     ImGui::PushID(path.c_str());
-    ImGui::SetCursorPosX(ImGui::GetStyle().WindowPadding.x + depth * 14.0f);
-    char label[512];
+    const float rowX = ImGui::GetStyle().WindowPadding.x + depth * 14.0f;
+    const float caretW = 12.0f;
     if (expandable) {
-        snprintf(label, sizeof(label), "%s %s", open ? "\xe2\x96\xbc" : "\xe2\x96\xb6",
-                 tc.i18n->T(node.name.c_str()));
-    } else {
-        snprintf(label, sizeof(label), "%s", tc.i18n->T(node.name.c_str()));
+        // The caret is a drawn triangle, not a text glyph: U+25B6 (closed
+        // caret) is missing from the CJK fonts the framework loads and
+        // rendered as "?" in the collapsed state.
+        ImGui::SetCursorPosX(rowX);
+        if (ImGui::InvisibleButton("##caret", ImVec2(caretW, ImGui::GetTextLineHeight()))) {
+            if (open) tc.expanded->erase(path);
+            else tc.expanded->insert(path);
+        }
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 a = ImGui::GetItemRectMin();
+        ImVec2 b = ImGui::GetItemRectMax();
+        const float cx = (a.x + b.x) * 0.5f;
+        const float cy = (a.y + b.y) * 0.5f;
+        const float r = ImGui::GetTextLineHeight() * 0.28f;
+        const ImU32 col = (ImGui::IsItemHovered() || sel)
+            ? ImGui::GetColorU32(theme::kGoldBright)
+            : ImGui::GetColorU32(theme::kSilverDim);
+        if (open) {
+            dl->AddTriangleFilled(ImVec2(cx - r, cy - r * 0.8f), ImVec2(cx + r, cy - r * 0.8f),
+                                  ImVec2(cx, cy + r * 0.8f), col);
+        } else {
+            dl->AddTriangleFilled(ImVec2(cx - r * 0.8f, cy - r), ImVec2(cx - r * 0.8f, cy + r),
+                                  ImVec2(cx + r * 0.8f, cy), col);
+        }
+        ImGui::SameLine(0.0f, 2.0f);
     }
+    ImGui::SetCursorPosX(expandable ? rowX + caretW + 2.0f : rowX);
     if (sel) ImGui::PushStyleColor(ImGuiCol_Text, theme::kGoldBright);
-    if (ImGui::Selectable(label, sel)) {
+    if (ImGui::Selectable(tc.i18n->T(node.name.c_str()), sel)) {
         *tc.selSettings = false;
         if (expandable) {
             if (open) tc.expanded->erase(path);
