@@ -60,13 +60,15 @@ struct Overlay {
     ComPtr<IDCompositionVisual> dvisual;
 
     bool imguiReady = false;
-    bool cursorShownByUs = false;   // we hid the cursor state on open, restore on close
-    int  cursorCheckTick = 0;
+    bool cursorHiddenByUs = false;  // we hid a previously visible cursor, restore on close
+    bool mousePosValid = false;     // ImGui mouse position known since menu open
     bool cursorVerifyPending = false;   // log the actual cursor state ~1s after restore
     LARGE_INTEGER cursorVerifyAt{};
     LARGE_INTEGER qpcNow{};
     LARGE_INTEGER qpcFreq{};
     LARGE_INTEGER qpcLast{};
+    LARGE_INTEGER diagNext{};           // 1 Hz input/present diagnostics while the menu is open
+    float presentMaxMs = 0.0f;
 
     GameWindow* gw = nullptr;
     Config* cfg = nullptr;
@@ -78,9 +80,28 @@ struct Overlay {
 
 Overlay g_ov;
 
+std::atomic<int> g_rawInputCount{ 0 };   // WM_INPUT seen by the overlay (diagnostic)
+
 LRESULT CALLBACK OverlayWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_INPUT) g_rawInputCount.fetch_add(1, std::memory_order_relaxed);
     return DefWindowProcW(h, msg, w, l);
+}
+
+// Diagnostic only: own raw-input registration for the mouse. If WM_INPUT still
+// reaches us while the hook eats every move, raw input survives LL-hook
+// blocking on this Windows build and blocking has to target it directly.
+void SetRawInputDiag(bool on) {
+    RAWINPUTDEVICE rid{};
+    rid.usUsagePage = 0x01;
+    rid.usUsage = 0x02;
+    rid.dwFlags = on ? RIDEV_INPUTSINK : RIDEV_REMOVE;
+    rid.hwndTarget = on ? g_ov.hwnd : nullptr;
+    if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+        Log("[ov] raw input diag %s failed err=%lu", on ? "on" : "off", GetLastError());
+    } else {
+        Log("[ov] raw input diag %s", on ? "on" : "off");
+    }
 }
 
 bool CreateOverlayWindow() {
@@ -342,23 +363,47 @@ void RenderFrame() {
     ImGuiIO& io = ImGui::GetIO();
 
     InputEvent ev;
+    bool gotPos = false;
     while (InputPop(&ev)) {
         switch (ev.type) {
             case InputEvent::Key: io.AddKeyEvent((ImGuiKey)ev.key, ev.down); break;
             case InputEvent::Btn: io.AddMouseButtonEvent(ev.key, ev.down); break;
             case InputEvent::Wheel: io.AddMouseWheelEvent(ev.wx, ev.wy); break;
+            case InputEvent::Move: {
+                POINT p{ (LONG)ev.wx, (LONG)ev.wy };
+                ScreenToClient(g_ov.hwnd, &p);
+                io.AddMousePosEvent((float)p.x, (float)p.y);
+                gotPos = true;
+                break;
+            }
         }
     }
-    POINT p{};
-    GetCursorPos(&p);
-    ScreenToClient(g_ov.hwnd, &p);
-    io.AddMousePosEvent((float)p.x, (float)p.y);
+    if (!gotPos && !g_ov.mousePosValid) {
+        // Seed once per open from the real cursor; afterwards the position
+        // comes from the hook's Move events - the real cursor is frozen, so
+        // polling it every frame would snap the menu cursor back.
+        POINT p{};
+        GetCursorPos(&p);
+        ScreenToClient(g_ov.hwnd, &p);
+        io.AddMousePosEvent((float)p.x, (float)p.y);
+    }
+    g_ov.mousePosValid = true;
 
     LARGE_INTEGER now{};
     QueryPerformanceCounter(&now);
     float dt = (float)((double)(now.QuadPart - g_ov.qpcLast.QuadPart) / (double)g_ov.qpcFreq.QuadPart);
     g_ov.qpcLast = now;
     dt = std::clamp(dt, 1.0f / 240.0f, 0.1f);
+    if (now.QuadPart >= g_ov.diagNext.QuadPart) {
+        g_ov.diagNext.QuadPart = now.QuadPart + g_ov.qpcFreq.QuadPart;
+        POINT rp{};
+        GetCursorPos(&rp);
+        Log("[ov] diag: hookMoves=%d raw=%d imgui=(%.0f,%.0f) real=(%ld,%ld) present<=%.1fms",
+            g_hookMoves.exchange(0, std::memory_order_relaxed),
+            g_rawInputCount.exchange(0, std::memory_order_relaxed),
+            io.MousePos.x, io.MousePos.y, rp.x, rp.y, g_ov.presentMaxMs);
+        g_ov.presentMaxMs = 0.0f;
+    }
     io.DisplaySize = ImVec2((float)g_ov.w, (float)g_ov.h);
     io.DisplayFramebufferScale = ImVec2(1, 1);
     io.DeltaTime = dt;
@@ -431,8 +476,13 @@ void RenderFrame() {
     g_ov.ctx->IASetInputLayout(nullptr);
     g_ov.ctx->Draw(3, 0);
 
+    LARGE_INTEGER p0{}, p1{};
+    QueryPerformanceCounter(&p0);
     g_ov.sc->Present(1, 0);
     g_ov.ddev->Commit();
+    QueryPerformanceCounter(&p1);
+    float pms = (float)((double)(p1.QuadPart - p0.QuadPart) * 1000.0 / (double)g_ov.qpcFreq.QuadPart);
+    if (pms > g_ov.presentMaxMs) g_ov.presentMaxMs = pms;
 }
 
 void SetVisible(bool v) {
@@ -445,25 +495,36 @@ void SetVisible(bool v) {
         }
         SetWindowPos(g_ov.hwnd, HWND_TOPMOST, g_ov.gw->x, g_ov.gw->y, g_ov.gw->w, g_ov.gw->h, SWP_NOACTIVATE);
         ShowWindow(g_ov.hwnd, SW_SHOWNA);
-        // Only take over the cursor when it was hidden (gameplay). If the game
-        // had it visible (its own menu), leave its counter untouched so closing
-        // our menu cannot break the game's cursor state.
+        // The input hook freezes the real cursor and ImGui draws its own
+        // (MouseDrawCursor), so the real one is hidden while the menu is open.
+        // Only hide it when it was visible; a hidden (gameplay) cursor is left
+        // untouched so closing our menu cannot break the game's cursor state.
         CURSORINFO ci{ sizeof(CURSORINFO) };
-        if (GetCursorInfo(&ci) && !(ci.flags & CURSOR_SHOWING)) {
-            g_ov.gw->ShowCursor(true);
-            g_ov.cursorShownByUs = true;
+        if (GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING)) {
+            g_ov.gw->ShowCursor(false);
+            g_ov.cursorHiddenByUs = true;
         } else {
-            g_ov.cursorShownByUs = false;
+            g_ov.cursorHiddenByUs = false;
         }
         g_ov.gw->UnclipCursor();
+        SetRawInputDiag(true);
+        g_ov.mousePosValid = false;
+        ImGui::GetIO().MouseDrawCursor = true;
+        // The cursor sits over OUR overlay window, so its visibility follows
+        // THIS thread's ShowCursor count - hiding it here never touches the
+        // game's own bookkeeping (the game-thread drain wedged the game's
+        // input state). ImGui draws the only cursor.
+        while (ShowCursor(FALSE) >= 0) {}
         QueryPerformanceCounter(&g_ov.qpcLast);
-        g_ov.cursorCheckTick = 0;
-        Log("[ov] menu open (hotkey, cursorShownByUs=%d)", (int)g_ov.cursorShownByUs);
+        Log("[ov] menu open (hotkey, cursorHiddenByUs=%d)", (int)g_ov.cursorHiddenByUs);
     } else {
         ShowWindow(g_ov.hwnd, SW_HIDE);
-        if (g_ov.cursorShownByUs) {
-            g_ov.gw->ShowCursor(false);   // single ShowCursor(FALSE): back to hidden
-            g_ov.cursorShownByUs = false;
+        SetRawInputDiag(false);
+        ImGui::GetIO().MouseDrawCursor = false;
+        ShowCursor(TRUE);   // our queue: back to 0 (visible), exact undo of the open drain
+        if (g_ov.cursorHiddenByUs) {
+            g_ov.gw->ShowCursor(true);   // force back to the pre-menu visible state
+            g_ov.cursorHiddenByUs = false;
             // The posted restore runs on the game window thread; verify the
             // actual global cursor state one second later.
             QueryPerformanceCounter(&g_ov.qpcNow);
@@ -475,6 +536,7 @@ void SetVisible(bool v) {
         Log("[ov] menu closed (config saved)");
     }
     g_menuOpen.store(v, std::memory_order_release);
+    if (v) InputRehook();   // jump our hooks to the LL chain front (see input.h)
 }
 
 void CleanupGraphics() {
@@ -537,15 +599,6 @@ DWORD WINAPI RenderThread(LPVOID) {
             while (PeekMessageW(&msg, g_ov.hwnd, 0, 0, PM_REMOVE)) {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
-            }
-            // Some games call ShowCursor(FALSE) repeatedly during gameplay and
-            // would fight our cursor; re-assert visibility if lost.
-            if (g_ov.cursorShownByUs && ++g_ov.cursorCheckTick >= 30) {
-                g_ov.cursorCheckTick = 0;
-                CURSORINFO ci{ sizeof(CURSORINFO) };
-                if (GetCursorInfo(&ci) && !(ci.flags & CURSOR_SHOWING)) {
-                    g_ov.gw->ShowCursor(true);
-                }
             }
             RenderFrame();
         } else {

@@ -5,7 +5,7 @@
 [PBZPhotoMode](https://github.com/lin-414/PBZPhotoMode) 这类 UE4SS C++ DLL 模组提供
 **快捷键呼出的游戏内设置界面**、多语言、以及可由框架统一编辑的模组配置（含键位）。
 
-当前状态：**0.1.0 原型已在模拟游戏窗口上端到端验证**（见下方"已验证"），待实机验证。
+当前状态：**0.2.0 输入全吞 + 自绘光标方案已实机验证**（2026-11-01：游戏内 F8 菜单打开期间镜头冻结、菜单光标 1:1 跟随、系统光标隐藏，关闭后游戏输入即恢复正常）。
 
 ![菜单截图](docs/prototype_menu_open.png)
 
@@ -28,7 +28,16 @@ PBZPhotoMode 的实机取证（其 PROGRESS.md"六连判死"）证明了两条�
 - d3d11/dxgi/dcomp 全部运行时 `LoadLibrary`（导入表只有系统基础 DLL），初始化推迟到游戏窗口
   出现之后（PBZPhotoMode 1.1.0 的加载期撞 RHI 教训）；
 - 输入：低级键盘/鼠标钩子。菜单关闭只截呼出键；菜单打开吞全部键鼠喂给 ImGui
-  （鼠标移动放行以保证光标可见），Esc 或呼出键关闭；
+  （鼠标移动同样吞掉——游戏经 Raw Input/鼠标捕获响应镜头，与光标下的窗口无关，
+  放行会导致游戏画面跟随鼠标；钩子把绝对位置直接喂给 overlay，菜单光标由 ImGui
+  自绘；游戏自己 SendInput 的合成移动只吞不喂），Esc 或呼出键关闭；
+  LL 钩子链"后装者先执行"——游戏输入栈/反作弊可能在模组加载后才装自己的低级钩子并
+  先行吃掉移动（实机 2026-11-01 症状：双光标重合冻结、镜头仍跟随），因此菜单打开时
+  本框架钩子会卸载重装插队到链首，关闭后保持链首直通；移动全部吞掉后 OS 光标不前进，
+  每个事件的 pt=冻结位置+本事件增量（实机 raw≈hookMoves 证明本系统 Raw Input 不受
+  LL 钩子阻断），故按"事件增量相对真实位置"自累积光标轨迹喂 ImGui（瞬移自归零，
+  禁止每帧干预游戏的 ClipCursor/ShowCursor——实测会卡死游戏输入状态机）；系统光标
+  悬停在覆盖窗上，其可见性归覆盖窗线程队列所有，打开时在渲染线程直接排到隐藏；
 - 光标显示/隐藏通过子类化游戏 WndProc 投递到窗口线程执行（ShowCursor 是线程相关的）；
 - 配置：PBZFM.ini（容错解析，菜单保存写回）；多语言：languages/*.json（扁平 JSON，
   热切换，内嵌兜底）；CJK 字体：加载系统微软雅黑（ImGui 1.92 动态字体图集）。
@@ -49,10 +58,17 @@ PBZPhotoMode 的实机取证（其 PROGRESS.md"六连判死"）证明了两条�
 | **实机**：游戏内 F8 开关菜单、2560x1440 渲染、FSR3 帧生成环境稳定 | ✅ 2026-11-01 |
 | **实机**：与 PBZPhotoMode 共存（F2 摄影模式 + F8 框架菜单同局） | ✅ 2026-11-01 |
 | **实机**：光标管理——游戏进行中开/关、游戏菜单内开/关两种路径均不破坏游戏光标状态 | ✅ 2026-11-01 |
+| 菜单打开时鼠标移动输入全吞（游戏镜头不跟随移动）+ ImGui 自绘菜单光标 | ✅ 2026-11-01 |
+| **实机**：菜单打开期间镜头冻结、菜单光标 1:1 跟随、系统光标隐藏；关闭后相机与游戏菜单光标即恢复 | ✅ 2026-11-01 |
+| **实机**：经框架界面改绑 PBZPhotoMode 键位（key_toggle 捕获）并正常保存 | ✅ 2026-11-01 |
+| **实机**：界面拖动移动/调整大小保留（会话内） | ✅ 2026-11-01 |
 
 自测方式：`host/pbzfm_host.exe` 注册一个名为 `UnrealWindow` 的窗口（框架寻找的目标类）、
 `LoadLibrary(PBZFM.dll)`（与 UE4SS 加载方式一致），脚本化 SendInput：F8 → 移动 → 点击 →
 逐帧截图到 `build/shots/`。点击目标由 DLL 导出的 `PBZFM_GetDemoButton` 实时查询。
+加 `--synthetic` 则改走 DLL 导出的合成输入通道（PBZFM_TestInjectMove/Button/ToggleMenu/
+TestDispatchHotkey）：不经 OS 输入流，可在有人正在使用桌面时确定性回归。真实注入路径
+依赖无人干扰的输入桌面——UAC/锁屏等安全桌面激活期间 LL 钩子收不到任何输入，属系统行为。
 
 ## 构建
 
@@ -60,17 +76,21 @@ PBZPhotoMode 的实机取证（其 PROGRESS.md"六连判死"）证明了两条�
 不需要 UEPseudo/Rust——原型 DLL 对 UE4SS 是零依赖的普通 DLL。
 
 ```bat
-tools\build.bat          :: 或在 cmd 里运行根目录 build_all.bat
-:: 产物 build\PBZFM.dll + build\pbzfm_host.exe
+build_all.bat            :: 构建（cmake + ninja），产物 build\PBZFM.dll + build\pbzfm_host.exe
 tools\pack.ps1           :: 出 dist\PBZ-Framework-Menu_0.2.0.zip（UE4SS 模组包）
 ```
 
-## 游戏内安装与验证
+**部署约定**：本仓库的自动化只到"构建 + 打包 dist zip"为止——**不向游戏目录部署或复制
+任何文件**。实机安装与测试由用户用模组管理器自行完成，测试结论反馈后录入上方"已验证"表。
+
+## 游戏内安装（用户用模组管理器自行完成，自动化不碰游戏目录）
 
 1. 安装 [UE4SS for PBZ](https://www.nexusmods.com/phantombladezero/mods/5)（KintaroModding fork）。
-2. 解压 `dist/PBZFM_0.1.0-prototype.zip` 到 `<游戏目录>\platform\steam\ue4ss\Mods\`，
-   形成 `ue4ss\Mods\PBZFM\{dlls\PBZFM.dll, enabled.txt, PBZFM.ini, languages\}`。
-3. 启动游戏按 F8；验证清单见包内 README.txt。排障先看 `ue4ss\Mods\PBZFM\PBZFM.log`。
+2. 用模组管理器（或手动解压）把 `dist/PBZ-Framework-Menu_0.2.0.zip` 装到
+   `<游戏目录>\platform\steam\ue4ss\Mods\`，形成
+   `ue4ss\Mods\PBZFM\{dlls\PBZFM.dll, enabled.txt, PBZFM.ini, languages\}`。
+3. 启动游戏按 F8；验证清单见包内 README.txt。排障先看 `Documents\PBZ\Logs\PBZFM.log`
+   （系统的“文档”目录，自动创建；该位置不可写时回落到 `ue4ss\Mods\PBZFM\PBZFM.log`）。
 
 ## 目录
 
@@ -86,7 +106,9 @@ docs/           自测截图
 
 ## 下一阶段（按优先级）
 
-1. **实机验证**：游戏内 F8、FSR3 帧生成开着跑、真独占全屏/多显示器边角。
+1. **实机验证**（用户用模组管理器安装 dist zip 后自行测试并反馈结论）：游戏内 F8、
+   FSR3 帧生成开着跑、真独占全屏/多显示器边角；菜单打开时镜头不跟随鼠标移动、
+   光标状态开/关往返不破坏。
 2. **注册 API**（C ABI 导出 + SDK 头，对齐 SKSEMenuFramework.h 形态）：
    `SetSection / AddSectionItem(渲染回调) / AddWindow / AddHudElement / AddInputEvent /
    AddConfigSchema(设置项描述) / 翻译表注册`；客户端模组 `GetModuleHandleW(L"PBZFM.dll")`

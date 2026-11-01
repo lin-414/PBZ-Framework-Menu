@@ -10,6 +10,9 @@
 #include <stb_image_write.h>
 
 #include <windows.h>
+#include <shlobj.h>
+#include <share.h>
+#include <cerrno>
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -32,11 +35,24 @@ typedef int  (*PBZFM_pfn_int)();
 typedef int  (*PBZFM_pfn_GetSectionName)(int, char*, int);
 typedef int  (*PBZFM_pfn_GetRect1)(int, float*);
 typedef int  (*PBZFM_pfn_GetRect0)(float*);
+typedef void (*PBZFM_TestInjectMoveFn)(int, int);
+typedef void (*PBZFM_TestInjectButtonFn)(int, bool);
+typedef void (*PBZFM_TestToggleMenuFn)(bool);
+typedef bool (*PBZFM_TestDispatchHotkeyFn)(unsigned);
 
 PBZFM_pfn_int pfnSectionCount;
 PBZFM_pfn_GetSectionName pfnSectionName;
 PBZFM_pfn_GetRect1 pfnSectionRect;
 PBZFM_pfn_GetRect0 pfnLastSchemaRect;
+PBZFM_TestInjectMoveFn pfnInjectMove;
+PBZFM_TestInjectButtonFn pfnInjectButton;
+PBZFM_TestToggleMenuFn pfnToggleMenu;
+PBZFM_TestDispatchHotkeyFn pfnDispatchHotkey;
+
+// --synthetic: drive the menu through the DLL's test-injection exports
+// instead of the real input stream, whose delivery depends on an
+// uncontended input desktop (a human using the machine races the strokes).
+bool g_synthetic = false;
 
 void Log(const char* fmt, ...) {
     va_list args;
@@ -110,7 +126,16 @@ void SendClickAt(float cx, float cy) {
     }
     POINT p{ (LONG)cx, (LONG)cy };
     ClientToScreen(g_hwnd, &p);
-    Log("click at client %.0f,%.0f -> screen %ld,%ld", cx, cy, p.x, p.y);
+    Log("click at client %.0f,%.0f -> screen %ld,%ld%s", cx, cy, p.x, p.y,
+        g_synthetic ? " (synthetic)" : "");
+    if (g_synthetic && pfnInjectMove && pfnInjectButton) {
+        pfnInjectMove(p.x, p.y);
+        Sleep(120);   // let the render thread consume the position first
+        pfnInjectButton(0, true);
+        Sleep(60);
+        pfnInjectButton(0, false);
+        return;
+    }
     SendMouseMove(p.x, p.y);
     Sleep(80);
     SendMouseButton(true);
@@ -150,11 +175,11 @@ bool SaveShot(const char* name) {
 }
 
 std::string ReadSmallFile(const char* path) {
-    FILE* f = nullptr;
-    errno_t e = fopen_s(&f, path, "rb");
-    if (e != 0 || !f) {
+    // _SH_DENYNO: PBZFM.log is held open by the DLL while we read it mid-run.
+    FILE* f = _fsopen(path, "rb", _SH_DENYNO);
+    if (!f) {
         char buf[160];
-        snprintf(buf, sizeof(buf), "(read failed: errno=%d winerr=%lu)", e, GetLastError());
+        snprintf(buf, sizeof(buf), "(read failed: errno=%d winerr=%lu)", errno, GetLastError());
         return buf;
     }
     std::string out;
@@ -183,7 +208,15 @@ void DumpArtifacts() {
     if (p != std::string::npos) d = d.substr(0, p);
     Log("--- demo_mod_state.txt ---\n%s", ReadSmallFile((d + "\\demo_mod_state.txt").c_str()).c_str());
     Log("--- data/demo.json ---\n%s", ReadSmallFile((d + "\\data\\demo.json").c_str()).c_str());
-    Log("--- PBZFM.log ---\n%s", ReadSmallFile((d + "\\PBZFM.log").c_str()).c_str());
+    std::string logPath = d + "\\PBZFM.log"; // fallback: beside the DLL
+    PWSTR docs = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
+        char docsA[MAX_PATH]{};
+        WideCharToMultiByte(CP_UTF8, 0, docs, -1, docsA, sizeof(docsA), nullptr, nullptr);
+        CoTaskMemFree(docs);
+        logPath = std::string(docsA) + "\\PBZ\\Logs\\PBZFM.log";
+    }
+    Log("--- PBZFM.log (%s) ---\n%s", logPath.c_str(), ReadSmallFile(logPath.c_str()).c_str());
 }
 
 void Finish() {
@@ -200,7 +233,8 @@ void Finish() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    g_synthetic = argc > 1 && strcmp(argv[1], "--synthetic") == 0;
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = HostWndProc;
@@ -243,6 +277,10 @@ int main() {
     pfnSectionName = (PBZFM_pfn_GetSectionName)GetProcAddress(g_dll, "PBZFM_GetSectionNameUtf8");
     pfnSectionRect = (PBZFM_pfn_GetRect1)GetProcAddress(g_dll, "PBZFM_GetSectionRect");
     pfnLastSchemaRect = (PBZFM_pfn_GetRect0)GetProcAddress(g_dll, "PBZFM_GetLastSchemaItemRect");
+    pfnInjectMove = (PBZFM_TestInjectMoveFn)GetProcAddress(g_dll, "PBZFM_TestInjectMove");
+    pfnInjectButton = (PBZFM_TestInjectButtonFn)GetProcAddress(g_dll, "PBZFM_TestInjectButton");
+    pfnToggleMenu = (PBZFM_TestToggleMenuFn)GetProcAddress(g_dll, "PBZFM_TestToggleMenu");
+    pfnDispatchHotkey = (PBZFM_TestDispatchHotkeyFn)GetProcAddress(g_dll, "PBZFM_TestDispatchHotkey");
 
     SetTimer(g_hwnd, 1, 900, nullptr);    // shot 00_initial
     SetTimer(g_hwnd, 2, 1500, nullptr);   // F8 -> menu
@@ -265,7 +303,10 @@ int main() {
             KillTimer(g_hwnd, (UINT)msg.wParam);
             switch (msg.wParam) {
                 case 1: SaveShot("00_initial.png"); break;
-                case 2: Log("F8 (open)"); SendKey(VK_F8); break;
+                case 2:
+                    Log("F8 (open)");
+                    if (g_synthetic && pfnToggleMenu) pfnToggleMenu(true); else SendKey(VK_F8);
+                    break;
                 case 3: {
                     int idx = -1;
                     for (int t = 0; t < 30 && idx < 0; ++t) {
@@ -309,8 +350,18 @@ int main() {
                     break;
                 }
                 case 8: SaveShot("03_custom_page.png"); break;
-                case 10: Log("F8 (close)"); SendKey(VK_F8); break;
-                case 11: Log("F9 (demo hotkey, menu closed)"); SendKey(VK_F9); break;
+                case 10:
+                    Log("F8 (close)");
+                    if (g_synthetic && pfnToggleMenu) pfnToggleMenu(false); else SendKey(VK_F8);
+                    break;
+                case 11:
+                    Log("F9 (demo hotkey, menu closed)");
+                    if (g_synthetic && pfnDispatchHotkey) {
+                        Log("hotkey dispatch -> %s", pfnDispatchHotkey(VK_F9) ? "consumed" : "not registered");
+                    } else {
+                        SendKey(VK_F9);
+                    }
+                    break;
                 case 12:
                     SaveShot("04_closed.png");
                     Finish();

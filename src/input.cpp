@@ -17,10 +17,58 @@ void Push(const InputEvent& e) {
     if (g_queue.size() < 256) g_queue.push_back(e);
 }
 
+// Motion carries position only, so a run of moves collapses into the newest
+// one: the queue stays bounded on high-polling mice and the hook stays fast.
+void PushMove(float x, float y) {
+    std::lock_guard<std::mutex> lock(g_queueMutex);
+    if (!g_queue.empty() && g_queue.back().type == InputEvent::Move) {
+        g_queue.back().wx = x;
+        g_queue.back().wy = y;
+        return;
+    }
+    if (g_queue.size() < 256) {
+        InputEvent e{};
+        e.type = InputEvent::Move;
+        e.wx = x;
+        e.wy = y;
+        g_queue.push_back(e);
+    }
+}
+
 HANDLE g_hookThread = nullptr;
+DWORD  g_hookThreadId = 0;
 HHOOK g_kbHook = nullptr;
 HHOOK g_mouseHook = nullptr;
 bool g_toggleWasDown = false;
+
+// Thread message: unhook + rehook, making our hooks the newest (first run)
+// in the LL chain again. Posted from the render thread on menu open.
+constexpr UINT WM_APP_PBZFM_REHOOK = WM_APP + 0x26;
+
+LRESULT CALLBACK KbProc(int code, WPARAM w, LPARAM l);
+LRESULT CALLBACK MouseProc(int code, WPARAM w, LPARAM l);
+
+// Menu-open motion tracking (hook thread only). Every move is eaten, so the
+// OS cursor never advances and each event's pt is (frozen position + this
+// event's delta, clamped by whatever ClipCursor the game re-asserted).
+// Accumulate the per-event delta (pt - current real position) into the
+// would-be cursor position for ImGui. A SetCursorPos teleport self-zeroes
+// (its pt equals the real position) and a real-cursor jump behind our back
+// is absorbed by the rebase instead of being followed.
+struct MoveTrack {
+    bool valid = false;
+    LONG baseX = 0, baseY = 0;    // real cursor position the last event saw
+    LONG trackX = 0, trackY = 0;  // would-be cursor position for ImGui
+};
+MoveTrack g_moveTrack;
+
+void RehookNow() {
+    if (g_kbHook) UnhookWindowsHookEx(g_kbHook);
+    if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
+    g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbProc, GetModuleHandleW(nullptr), 0);
+    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, GetModuleHandleW(nullptr), 0);
+    Log("[input] hooks re-queued to chain front (kb=%p mouse=%p)", (void*)g_kbHook, (void*)g_mouseHook);
+}
 
 int VkToImGuiKey(UINT vk) {
     switch (vk) {
@@ -126,7 +174,10 @@ LRESULT CALLBACK KbProc(int code, WPARAM w, LPARAM l) {
 
 LRESULT CALLBACK MouseProc(int code, WPARAM w, LPARAM l) {
     if (code < 0 || !g_running) return CallNextHookEx(g_mouseHook, code, w, l);
-    if (!g_menuOpen.load(std::memory_order_relaxed)) return CallNextHookEx(g_mouseHook, code, w, l);
+    if (!g_menuOpen.load(std::memory_order_relaxed)) {
+        g_moveTrack.valid = false;   // rebase on the next open
+        return CallNextHookEx(g_mouseHook, code, w, l);
+    }
     MSLLHOOKSTRUCT* s = (MSLLHOOKSTRUCT*)l;
     InputEvent e{};
     switch (w) {
@@ -145,21 +196,40 @@ LRESULT CALLBACK MouseProc(int code, WPARAM w, LPARAM l) {
             e.type = InputEvent::Wheel; e.wx = (float)GET_WHEEL_DELTA_WPARAM(s->mouseData) / (float)WHEEL_DELTA; e.wy = 0.0f;
             Push(e); return 1;
         case WM_MOUSEMOVE:
-            // Pass moves through: eating them freezes the real cursor (the
-            // position ImGui polls would never advance). The overlay window is
-            // under the cursor anyway, so the game window sees no mouse.
-            return CallNextHookEx(g_mouseHook, code, w, l);
+            // Eat moves too: a running game reacts to motion via its own hook
+            // data or raw input, neither of which cares which window is under
+            // the cursor. Injected (SendInput) moves are synthetic - eat them
+            // but never treat them as user motion.
+            if (!(s->flags & LLMHF_INJECTED)) {
+                POINT cur{};
+                GetCursorPos(&cur);
+                if (!g_moveTrack.valid) {
+                    g_moveTrack.baseX = g_moveTrack.trackX = cur.x;
+                    g_moveTrack.baseY = g_moveTrack.trackY = cur.y;
+                    g_moveTrack.valid = true;
+                } else if (cur.x != g_moveTrack.baseX || cur.y != g_moveTrack.baseY) {
+                    g_moveTrack.baseX = cur.x;   // the game teleported the real
+                    g_moveTrack.baseY = cur.y;   // cursor: absorb, don't follow
+                }
+                g_moveTrack.trackX += s->pt.x - g_moveTrack.baseX;
+                g_moveTrack.trackY += s->pt.y - g_moveTrack.baseY;
+                PushMove((float)g_moveTrack.trackX, (float)g_moveTrack.trackY);
+                g_hookMoves.fetch_add(1, std::memory_order_relaxed);
+            }
+            return 1;
         default:
             return 1;
     }
 }
 
 DWORD WINAPI HookThread(LPVOID) {
+    g_hookThreadId = GetCurrentThreadId();
     g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbProc, GetModuleHandleW(nullptr), 0);
     g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, GetModuleHandleW(nullptr), 0);
     Log("[input] hooks installed (kb=%p mouse=%p)", (void*)g_kbHook, (void*)g_mouseHook);
     MSG msg;
     while (g_running.load(std::memory_order_relaxed) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_APP_PBZFM_REHOOK) { RehookNow(); continue; }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -193,6 +263,12 @@ bool InputPop(InputEvent* out) {
     *out = g_queue.front();
     g_queue.pop_front();
     return true;
+}
+
+void InputPushEvent(const InputEvent& e) { Push(e); }
+
+void InputRehook() {
+    if (g_hookThreadId) PostThreadMessageW(g_hookThreadId, WM_APP_PBZFM_REHOOK, 0, 0);
 }
 
 } // namespace pbzfm

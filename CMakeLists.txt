@@ -30,7 +30,7 @@ add_library(PBZFM SHARED
     src/schema.cpp
     src/api.cpp)
 target_include_directories(PBZFM PRIVATE src sdk third_party)
-target_link_libraries(PBZFM PRIVATE imgui user32 gdi32)
+target_link_libraries(PBZFM PRIVATE imgui user32 gdi32 shell32)
 target_compile_definitions(PBZFM PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(PBZFM PRIVATE /utf-8 /EHsc /W3)
 set_target_properties(PBZFM PROPERTIES PREFIX "")
@@ -44,7 +44,7 @@ set_target_properties(demo_mod PROPERTIES PREFIX "")
 
 add_executable(pbzfm_host host/main.cpp)
 target_include_directories(pbzfm_host PRIVATE src sdk third_party)
-target_link_libraries(pbzfm_host PRIVATE user32 gdi32)
+target_link_libraries(pbzfm_host PRIVATE user32 gdi32 shell32)
 target_compile_definitions(pbzfm_host PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(pbzfm_host PRIVATE /utf-8 /EHsc /W3)
 add_dependencies(pbzfm_host PBZFM demo_mod)

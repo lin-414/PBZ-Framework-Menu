@@ -25,10 +25,11 @@ extern std::atomic<int>  g_btnCliX;      // demo button rect, overlay client coo
 extern std::atomic<int>  g_btnCliY;      // (menu.cpp writes, overlay converts to screen)
 extern std::atomic<int>  g_btnScrX;      // demo button center, screen coords (-1 = unknown)
 extern std::atomic<int>  g_btnScrY;
+extern std::atomic<int>  g_hookMoves;    // real mouse moves seen by the hook while menu open (diagnostic)
 
 extern const char* const kVersion;
 
-// ---- logging (thread-safe, appends to <mod root>\PBZFM.log) ----
+// ---- logging (thread-safe, appends to <Documents>\PBZ\Logs\PBZFM.log, falls back to <mod root>\PBZFM.log) ----
 void Log(const char* fmt, ...);
 
 // ---- paths ----

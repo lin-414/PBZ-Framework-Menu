@@ -7,6 +7,7 @@
 #include "game_window.h"
 #include "input.h"
 #include "overlay.h"
+#include "registry.h"
 
 #include <cstdio>
 #include <cstdarg>
@@ -14,6 +15,7 @@
 #include <mutex>
 #include <algorithm>
 #include <cwctype>
+#include <shlobj.h>
 
 namespace pbzfm {
 
@@ -29,6 +31,7 @@ std::atomic<int>  g_btnCliX{ -1 };
 std::atomic<int>  g_btnCliY{ -1 };
 std::atomic<int>  g_btnScrX{ -1 };
 std::atomic<int>  g_btnScrY{ -1 };
+std::atomic<int>  g_hookMoves{ 0 };
 
 const char* const kVersion = "0.2.0";
 
@@ -41,6 +44,21 @@ std::mutex g_logMutex;
 FILE* g_logFile = nullptr;
 std::wstring g_logPath;
 bool g_logPathResolved = false;
+
+// Preferred log location: <Documents>\PBZ\Logs, created on demand. Empty when unavailable.
+std::wstring DocumentsLogsDir() {
+    PWSTR docs = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) return {};
+    std::wstring dir = docs;
+    CoTaskMemFree(docs);
+    dir += L"\\PBZ";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    dir += L"\\Logs";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    DWORD attr = GetFileAttributesW(dir.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) return {};
+    return dir;
+}
 
 std::wstring Utf8ToWide(const std::string& u) {
     if (u.empty()) return {};
@@ -98,13 +116,20 @@ DWORD WINAPI InitThreadProc(LPVOID) {
 void Log(const char* fmt, ...) {
     std::lock_guard<std::mutex> lock(g_logMutex);
     if (!g_logPathResolved) {
-        g_logPath = RootFile(L"PBZFM.log");
+        std::wstring docs = DocumentsLogsDir();
+        g_logPath = docs.empty() ? RootFile(L"PBZFM.log") : docs + L"\\PBZFM.log";
         g_logPathResolved = true;
     }
     if (!g_logFile) {
         // _SH_DENYNO so log tailing works while the game is running (fopen/fopen_s deny sharing).
         g_logFile = _wfsopen(g_logPath.c_str(), L"ab", _SH_DENYNO);
-        if (!g_logFile) return;
+        if (!g_logFile) {
+            const std::wstring fallback = RootFile(L"PBZFM.log");
+            if (fallback == g_logPath) return;
+            g_logPath = fallback; // Documents location unusable - log beside the mod instead
+            g_logFile = _wfsopen(g_logPath.c_str(), L"ab", _SH_DENYNO);
+            if (!g_logFile) return;
+        }
     }
     SYSTEMTIME st{};
     GetLocalTime(&st);
@@ -194,6 +219,39 @@ __declspec(dllexport) bool PBZFM_GetDemoButton(long* x, long* y) {
     *x = g_btnScrX.load(std::memory_order_relaxed);
     *y = g_btnScrY.load(std::memory_order_relaxed);
     return *x >= 0 && *y >= 0;
+}
+
+// Test hooks: synthetic input for the host test (input.h InputPushEvent).
+// They feed the same event queue the low-level hooks write, so the render
+// thread and everything downstream are exercised for real.
+__declspec(dllexport) void PBZFM_TestInjectMove(int sx, int sy) {
+    pbzfm::InputEvent e{};
+    e.type = pbzfm::InputEvent::Move;
+    e.wx = (float)sx;
+    e.wy = (float)sy;
+    pbzfm::InputPushEvent(e);
+}
+
+__declspec(dllexport) void PBZFM_TestInjectButton(int btn, bool down) {
+    pbzfm::InputEvent e{};
+    e.type = pbzfm::InputEvent::Btn;
+    e.key = btn;
+    e.down = down;
+    pbzfm::InputPushEvent(e);
+}
+
+__declspec(dllexport) void PBZFM_TestToggleMenu(bool open) {
+    if (open) {
+        g_wantToggle.store(true, std::memory_order_release);
+    } else {
+        g_closeRequest.store(true, std::memory_order_release);
+    }
+}
+
+// Mirrors what the keyboard hook does for a closed-menu key (registry
+// hotkeys fire on down edges).
+__declspec(dllexport) bool PBZFM_TestDispatchHotkey(unsigned vk) {
+    return pbzfm::RegistryDispatchHotkey(vk, false);
 }
 
 // UE4SS C++ mod lifecycle contract (CppMod.cpp requires both exports; without
