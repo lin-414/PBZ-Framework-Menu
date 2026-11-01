@@ -42,3 +42,13 @@
 | 纹理 API LoadTexture/Image/DisposeTexture（stb_image，渲染线程上传） | ⏳ 待实机（host 未断言） |
 | 新 Widget：InputText/CollapsingHeader/Selectable/ProgressBar/ColorEdit3 | ⏳ 待实机（host 未断言） |
 | DLL 版本资源（0.4.0）+ i18n_test 进 CTest（32 条/语言 ALL OK） | ✅ 2026-11-01 |
+
+## 0.5.0 新增（host 回归通过；实机复核待做）
+
+| 项 | 结果 |
+| --- | --- |
+| 侧边栏分类树（单页模组单行、展开箭头、再点收起、选中金色 + 朱砂条） | ⏳ 待实机（host 截图覆盖默认视图） |
+| 嵌套路径 API：SetSectionPath / ConfigCreatePath / AddSectionItemPath（'/' 分隔、'\\' 转义、中间节点自动创建） | ✅ demo_mod "演示模组/高级参数" 经 host 回归 |
+| 树形搜索过滤（子树匹配、过滤期间全展开） | ⏳ 待实机（host 未断言） |
+| 展开状态仅会话内（不写 PBZFM.ini，按用户选择） | ✅ 设计确认 |
+| v1 兼容：单段名 Rename/Delete/Remove 与旧调用不变；GetSectionCount/Rect 仍按根行枚举 | ✅ host 回归全绿 |

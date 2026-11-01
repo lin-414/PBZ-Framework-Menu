@@ -13,7 +13,7 @@ include [sdk/pbzfm.h](sdk/pbzfm.h)（dist zip 内路径 `PBZFM/sdk/pbzfm.h`）�
 ### 版本与兼容策略（0.4.0 起）
 
 - 头文件里的 `PBZFM_ABI_VERSION`（当前 1）是**本头文件要求的最低框架版本**；
-  `PBZFM_GetAbiVersion()` 返回**运行中框架的 API 版本**（0.4.0 起为 2）。加载条件是
+  `PBZFM_GetAbiVersion()` 返回**运行中框架的 API 版本**（0.5.0 / API v3）。加载条件是
   框架版本 ≥ 头文件要求版本——旧头文件配新框架继续工作。
 - 必需核心（v1 的全部导出）解析失败才算加载失败；0.4.0 新增的导出按**可选**解析，
   对应函数指针在旧框架上为 NULL——调用前判空（`if (api.RemoveHotkey) …`）。
@@ -126,7 +126,8 @@ api.ConfigAddKey  (cfg, "shot_key",  "截图键", VK_F9);             // 键位�
 
 ### 分区与页签生命周期（0.4.0）
 
-`SetSection` 注册的分区是全进程共享命名空间里的实体，现在可以运行时管理：
+`SetSection` 注册的分区是全进程共享命名空间里的实体，现在可以运行时管理
+（0.5.0 起三个函数的第一个参数是**路径**，单段路径即顶层分区，v1 按名字调用不变）：
 
 ```cpp
 api.RenameSection("旧名", "新名");            // 1 = 成功；目标重名/来源缺失 = 0
@@ -137,7 +138,28 @@ api.RemoveSectionItem("分区名", "页签名");     // 只删一页
 - 删除分区**不删**它的 schema 数据文件（data/<store>.json 保留，重新注册同名
   store 会重新加载）；
 - 删除/改名后，本线程的"当前分区"失效——继续注册前重新 `SetSection`；
-- 改名会改掉以文本为 key 的翻译查表键（见《多语言》），改名后旧译文不再命中。
+NaN```cpp
+if (api.SetSectionPath) api.SetSectionPath("我的模组/冻结方式");
+// 或一步到位（等价，且不改变"当前分区"）：
+if (api.ConfigCreatePath) {
+    if (PBZFM_Config adv = api.ConfigCreatePath("author.mymod", "我的模组/冻结方式")) {
+        api.ConfigAddBool(adv, "freeze_world", "冻结世界", 1);
+    }
+}
+if (api.AddSectionItemPath) api.AddSectionItemPath("我的模组/关于", RenderAbout, nullptr);
+```
+
+- 路径语法：`/` 分隔段，`\` 转义下一字节（段内字面 `/` 写 `\/）；单段路径
+  即顶层分区——`SetSectionPath("A")` 与 `SetSection("A")` 等价；
+- 缺失的中间节点自动创建（空节点仅作分组，不渲染内容）；
+- 页面内容挂在路径节点上：`ConfigCreatePath(store, path)` 的页签名取路径
+  末段；同一节点也可用 `AddSectionItemPath` 挂自定义页；
+- **树形交互**：只有"单页且无子节点"的分区渲染成单行（简单模组外观与旧版完全
+  一致）；有子节点或多页的分区带展开箭头，点击分类右侧只显示该分类的内容，
+  再点一次已选中的父节点会收起/展开；展开状态**仅本次会话**有效，不写配置；
+- v1 API 与路径 API 完全互通：`SetSection("我的模组")` 后照常 `ConfigCreate`，
+  得到的页面同样是"我的模组"的子行；注意从 0.5.0 起分区名里的 `/` 会被解释为
+  层级分隔（此前它是名字的一部分），名字含斜杠的存量分区请改用转义或换名。
 
 ### 自定义页与 Widget API
 

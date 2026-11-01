@@ -76,6 +76,15 @@ DWORD WINAPI InitThread(LPVOID) {
     api.ConfigAddKey(cfg, "shot_key", "截图键", '9');
     api.ConfigOnChange(cfg, OnChange, nullptr);
 
+    // v3 path API (optional export): a nested category under the same mod.
+    // The sidebar renders 演示模组 as an expandable node holding 设置 + 高级参数.
+    if (api.ConfigCreatePath) {
+        if (PBZFM_Config adv = api.ConfigCreatePath("demo.adv", "演示模组/高级参数")) {
+            api.ConfigAddBool(adv, "grain", "胶片颗粒", 0);
+            api.ConfigAddInt(adv, "vignette", "暗角强度", 2, 0, 5);
+        }
+    }
+
     // Custom widget-API section as its own sidebar entry so the host can
     // navigate deterministically through exported rects.
     api.SetSection("演示模组 · 自定义");

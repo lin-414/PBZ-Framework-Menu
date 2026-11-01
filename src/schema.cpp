@@ -154,19 +154,14 @@ bool ConfigDef::Save(const std::wstring& path) {
     return ok;
 }
 
-ConfigDef* SchemaCreateConfig(const char* store_utf8, const char* page_label_utf8) {
+ConfigDef* SchemaCreateConfigAt(Section* section, const char* store_utf8, const char* page_label_utf8) {
+    if (!section) return nullptr;
     ConfigDef* cfg = new ConfigDef();
     cfg->store = store_utf8 ? store_utf8 : "config";
-    Section* s = RegistryCurrentSection();
-    if (!s) {
-        Log("[schema] no current section for config %s (call SetSection first)", cfg->store.c_str());
-        delete cfg;
-        return nullptr;
-    }
     Page p;
     p.label = page_label_utf8 ? page_label_utf8 : cfg->store;
     p.schemaCfg = cfg;
-    RegistryAddPage(s, p);
+    RegistryAddPage(section, p);
     {
         std::lock_guard<std::mutex> lock(g_cfgMtx);
         g_configs.emplace_back(cfg);
@@ -175,6 +170,16 @@ ConfigDef* SchemaCreateConfig(const char* store_utf8, const char* page_label_utf
         Log("[schema] store loaded: %s", cfg->store.c_str());
     }
     return cfg;
+}
+
+ConfigDef* SchemaCreateConfig(const char* store_utf8, const char* page_label_utf8) {
+    Section* s = RegistryCurrentSection();
+    if (!s) {
+        Log("[schema] no current section for config %s (call SetSection first)",
+            store_utf8 ? store_utf8 : "config");
+        return nullptr;
+    }
+    return SchemaCreateConfigAt(s, store_utf8, page_label_utf8);
 }
 
 ConfigDef* SchemaValidate(void* handle) {

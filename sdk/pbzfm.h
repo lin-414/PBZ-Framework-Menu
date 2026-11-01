@@ -80,7 +80,7 @@
 #include <windows.h>
 
 #define PBZFM_ABI_VERSION 1   /* minimum API version this header requires  */
-#define PBZFM_API_VERSION 2   /* API version of the framework build        */
+#define PBZFM_API_VERSION 3   /* API version of the framework build        */
 
 /* Modifier bits for AddHotkeyEx / ConfigAddKeyCombo (v2). A chord fires only
  * when the held modifiers match exactly - holding an extra Shift does not
@@ -122,14 +122,28 @@ PBZFM_API int  PBZFM_IsMenuOpen(void);     /* 1 while the overlay menu is visibl
 PBZFM_API void PBZFM_SetSection(const char* name_utf8);
 PBZFM_API void PBZFM_AddSectionItem(const char* label_utf8, PBZFM_RenderFn fn, void* userdata);
 
-/* v2 lifecycle: identify a section by the name given to SetSection. Renaming
- * keeps pages; deleting a section that had a schema page leaves the config
- * store on disk (values reload if the mod re-registers it). After deleting or
- * renaming the section that is your calling thread's current section, call
- * SetSection again before ConfigCreate/AddSectionItem. Returns 1 on success. */
-PBZFM_API int  PBZFM_RenameSection(const char* old_utf8, const char* new_utf8);
-PBZFM_API int  PBZFM_DeleteSection(const char* name_utf8);
-PBZFM_API int  PBZFM_RemoveSectionItem(const char* section_utf8, const char* label_utf8);
+/* v2 lifecycle: targets are PATHS (see SetSectionPath); a single segment
+ * resolves to a top-level section, which is exactly the v1 "by name" call.
+ * Renaming renames the node's last segment (a single-segment name, no '/'),
+ * fails on sibling collisions; deleting removes the node's whole subtree but
+ * leaves its schema config stores on disk (values reload if the mod
+ * re-registers the store). After deleting or renaming the node that is your
+ * calling thread's current section, call SetSection/SetSectionPath again
+ * before ConfigCreate/AddSectionItem. Returns 1 on success. */
+PBZFM_API int  PBZFM_RenameSection(const char* target_path, const char* new_utf8);
+PBZFM_API int  PBZFM_DeleteSection(const char* target_path);
+PBZFM_API int  PBZFM_RemoveSectionItem(const char* target_path, const char* label_utf8);
+
+/* v3 nested paths: "Mod/Category/Sub" - '/' separates segments, a backslash
+ * escapes the next byte (a literal '/' in a segment is "\/"). A single-segment
+ * path is a top-level section, i.e. SetSectionPath("A") == SetSection("A").
+ * The node at the path carries the page; missing intermediates are created
+ * empty, so the sidebar grows a tree. The in-game sidebar renders one flat
+ * row for a node that has a single page and no children - only real trees
+ * grow carets. */
+PBZFM_API void PBZFM_SetSectionPath(const char* path_utf8);
+PBZFM_API void PBZFM_AddSectionItemPath(const char* path_utf8, PBZFM_RenderFn fn, void* userdata);
+PBZFM_API PBZFM_Config PBZFM_ConfigCreatePath(const char* store_utf8, const char* path_utf8);
 
 /* ---- schema-backed settings --------------------------------------------- */
 
@@ -308,6 +322,10 @@ struct PBZFM_Api {
     void     (*ProgressBar)(float fraction, float width, const char* overlay_utf8);
     int      (*ColorEdit3)(const char*, float rgb[3]);
     const char* (*VersionString)(void);
+    /* ---- v3 additions (optional; NULL when the framework predates them) ---- */
+    void     (*SetSectionPath)(const char* path_utf8);
+    void     (*AddSectionItemPath)(const char* path_utf8, PBZFM_RenderFn, void*);
+    PBZFM_Config (*ConfigCreatePath)(const char* store_utf8, const char* path_utf8);
 };
 
 #ifdef __cplusplus
@@ -380,6 +398,10 @@ static int PBZFM_LoadApi(struct PBZFM_Api* out) {
     PBZFM_GET_OPT(ProgressBar, "PBZFM_ProgressBar");
     PBZFM_GET_OPT(ColorEdit3, "PBZFM_ColorEdit3");
     PBZFM_GET_OPT(VersionString, "PBZFM_Version");
+    /* v3: optional - nested-path registration. */
+    PBZFM_GET_OPT(SetSectionPath, "PBZFM_SetSectionPath");
+    PBZFM_GET_OPT(AddSectionItemPath, "PBZFM_AddSectionItemPath");
+    PBZFM_GET_OPT(ConfigCreatePath, "PBZFM_ConfigCreatePath");
 #undef PBZFM_GET_OPT
 #undef PBZFM_GET
     if (out->GetAbiVersion() < PBZFM_ABI_VERSION) return 0;

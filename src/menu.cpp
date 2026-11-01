@@ -1,6 +1,8 @@
-// The menu panel: sidebar of mod sections -> tabbed pages. Pages are either
-// schema-backed (auto-rendered form, framework persists the values) or custom
-// render callbacks supplied through the PBZFM C API (widget API inside).
+// The menu panel: sidebar section tree -> page content. A section node can
+// carry its own page (schema-backed or a custom render callback) and child
+// sections (the nested-path API); the tree replaces the old flat sidebar +
+// tab-bar pair. Nodes with a single page render as one flat row, so simple
+// mods look exactly like before; only real trees grow carets.
 #include "menu.h"
 #include "config.h"
 #include "i18n.h"
@@ -13,6 +15,7 @@
 #include <imgui.h>
 #include <cstdio>
 #include <cstring>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -42,6 +45,151 @@ bool SidebarFilterMatch(const char* hay, const char* needle) {
         if (j == nlen) return true;
     }
     return false;
+}
+
+// First node carrying content, depth-first: used to land somewhere sensible
+// when a selection vanishes or on the first frame.
+const Section* FirstContentNode(const Section& n, int* pageIdx) {
+    if (!n.pages.empty()) {
+        *pageIdx = 0;
+        return &n;
+    }
+    for (const auto& c : n.children) {
+        if (const Section* hit = FirstContentNode(*c, pageIdx)) return hit;
+    }
+    return nullptr;
+}
+
+// A node stays visible under the search filter when it, one of its pages, or
+// any descendant matches. While filtering the whole tree renders expanded.
+bool SubtreeMatchesFilter(const Section& n, const char* needle) {
+    if (SidebarFilterMatch(n.name.c_str(), needle)) return true;
+    for (const auto& p : n.pages) {
+        if (SidebarFilterMatch(p.label.c_str(), needle)) return true;
+    }
+    for (const auto& c : n.children) {
+        if (SubtreeMatchesFilter(*c, needle)) return true;
+    }
+    return false;
+}
+
+// Mark every ancestor of the node expanded (a newly auto-selected leaf must
+// not hide inside a collapsed branch).
+void ExpandAncestors(std::set<std::string>& expanded, const Section& n) {
+    for (const Section* p = n.parent; p; p = p->parent) {
+        expanded.insert(RegistryPathOf(p));
+    }
+}
+
+struct TreeCtx {
+    I18n* i18n;
+    const char* search;                 // "" = no filter
+    std::string* selPath;
+    int* selPage;
+    bool* selSettings;
+    std::set<std::string>* expanded;
+    int rootIdx = -1;                   // automation rect index for depth-0 rows
+    int* visibleRoots = nullptr;
+};
+
+// One row = one Selectable, caret glyph embedded in the label. Click rules:
+//  - node without content (a pure group): toggle expand + select first leaf;
+//  - node with content: select it; clicking it again toggles its children;
+//  - page rows (a multi-page node's own pages) select (node, page).
+void RenderTreeNode(Section& node, int depth, TreeCtx& tc) {
+    const bool filtering = tc.search[0] != 0;
+    if (filtering && !SubtreeMatchesFilter(node, tc.search)) return;
+
+    const std::string path = RegistryPathOf(&node);
+    const bool open = filtering || tc.expanded->count(path) != 0;
+    const bool expandable = !node.children.empty() || node.pages.size() > 1;
+    const bool sel = !*tc.selSettings && *tc.selPath == path;
+
+    ImGui::PushID(path.c_str());
+    ImGui::SetCursorPosX(ImGui::GetStyle().WindowPadding.x + depth * 14.0f);
+    char label[512];
+    if (expandable) {
+        snprintf(label, sizeof(label), "%s %s", open ? "\xe2\x96\xbc" : "\xe2\x96\xb6",
+                 tc.i18n->T(node.name.c_str()));
+    } else {
+        snprintf(label, sizeof(label), "%s", tc.i18n->T(node.name.c_str()));
+    }
+    if (sel) ImGui::PushStyleColor(ImGuiCol_Text, theme::kGoldBright);
+    if (ImGui::Selectable(label, sel)) {
+        *tc.selSettings = false;
+        if (!node.pages.empty()) {
+            // Select the node's content; clicking an already-selected parent
+            // toggles its children (there is no separate caret widget).
+            const bool wasSelected = sel;
+            *tc.selPath = path;
+            *tc.selPage = 0;
+            if (expandable) {
+                if (wasSelected) {
+                    if (open) tc.expanded->erase(path);
+                    else tc.expanded->insert(path);
+                } else if (!open) {
+                    tc.expanded->insert(path);
+                }
+            }
+        } else if (!node.children.empty()) {
+            if (open) tc.expanded->erase(path);
+            else tc.expanded->insert(path);
+            int idx = 0;
+            if (const Section* f = FirstContentNode(node, &idx)) {
+                *tc.selPath = RegistryPathOf(f);
+                *tc.selPage = idx;
+                ExpandAncestors(*tc.expanded, *f);
+            }
+        }
+    }
+    if (sel) {
+        ImGui::PopStyleColor();
+        ImVec2 ra = ImGui::GetItemRectMin();
+        ImVec2 rb = ImGui::GetItemRectMax();
+        ImGui::GetForegroundDrawList()->AddRectFilled(
+            ImVec2(ra.x, ra.y), ImVec2(ra.x + 3.0f, rb.y),
+            ImGui::GetColorU32(theme::kCinnabar));
+    }
+    if (depth == 0) {
+        ++*tc.visibleRoots;
+        if (tc.rootIdx >= 0) {
+            ImVec2 ra = ImGui::GetItemRectMin();
+            ImVec2 rb = ImGui::GetItemRectMax();
+            float rect[4] = { ra.x, ra.y, rb.x, rb.y };
+            RegistryRecordSectionRect(tc.rootIdx, rect);
+        }
+    }
+
+    // The node's own pages render as child rows once it holds more than one
+    // (single-page nodes are the row itself - no extra hop).
+    if (open && node.pages.size() > 1) {
+        for (int pgi = 0; pgi < (int)node.pages.size(); ++pgi) {
+            ImGui::PushID(pgi);
+            ImGui::SetCursorPosX(ImGui::GetStyle().WindowPadding.x + (depth + 1) * 14.0f);
+            const bool pageSel = sel && *tc.selPage == pgi;
+            if (pageSel) ImGui::PushStyleColor(ImGuiCol_Text, theme::kGoldBright);
+            if (ImGui::Selectable(tc.i18n->T(node.pages[pgi].label.c_str()), pageSel)) {
+                *tc.selSettings = false;
+                *tc.selPath = path;
+                *tc.selPage = pgi;
+            }
+            if (pageSel) {
+                ImGui::PopStyleColor();
+                ImVec2 ra = ImGui::GetItemRectMin();
+                ImVec2 rb = ImGui::GetItemRectMax();
+                ImGui::GetForegroundDrawList()->AddRectFilled(
+                    ImVec2(ra.x, ra.y), ImVec2(ra.x + 3.0f, rb.y),
+                    ImGui::GetColorU32(theme::kCinnabar));
+            }
+            ImGui::PopID();
+        }
+    }
+    if (open) {
+        for (const auto& c : node.children) {
+            RenderTreeNode(*c, depth + 1, tc);
+        }
+    }
+    ImGui::PopID();
 }
 
 void FrameworkSettingsPage(void*) {
@@ -230,9 +378,13 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
         dl->AddRect(sc, ImVec2(sc.x + sealS, sc.y + sealS), ink);
     }
 
-    // -2 = first frame, -1 = framework settings page, else a registry index.
-    static int selSection = -2;
+    // Tree selection, session-only by design: the selected node path, which of
+    // its pages, whether the corner settings button owns the content, and the
+    // expanded set. All of it resets when the DLL reloads.
+    static std::string selPath;
     static int selPage = 0;
+    static bool selSettings = false;
+    static std::set<std::string> expanded;
 
     // Hold the registry for the whole frame: registration from other threads
     // waits at most one frame; our own recursive calls stay legal.
@@ -240,10 +392,10 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
     auto& sections = RegistrySections();
 
     // The framework keeps its settings page in the registry like any client,
-    // but it is chrome, not a mod: the sidebar skips it and the bottom-left
-    // corner button switches to it (selSection == -1). Labels are stored as
-    // raw i18n keys: the render sites below run them through T(), so a
-    // language switch applies without re-registering.
+    // but it is chrome, not a mod: the tree skips it and the bottom-left
+    // corner button switches to it. Labels are stored as raw i18n keys: the
+    // render sites run them through T(), so a language switch applies without
+    // re-registering.
     Section* fw = RegistryGetOrCreateSection("framework_section");
     if (fw && fw->pages.empty()) {
         Page p;
@@ -253,20 +405,21 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
         s_frameworkRegistered = true;
     }
 
-    int fwIdx = -1;
-    for (int i = 0; i < (int)sections.size(); ++i) {
-        if (sections[i].get() == fw) { fwIdx = i; break; }
-    }
-    // First frame (or a vanished section): open on the first mod section,
+    // First frame (or a vanished selection): open on the first mod content,
     // straight onto settings when none has registered yet.
-    if (selSection == -2 || selSection == fwIdx || selSection >= (int)sections.size()) {
-        selSection = -1;
-        for (int i = 0; i < (int)sections.size(); ++i) {
-            if (sections[i].get() != fw) { selSection = i; break; }
-        }
-    }
-    if (selSection >= 0 && selPage >= (int)sections[selSection]->pages.size()) {
+    if (!selSettings && (selPath.empty() || !RegistryFindPath(selPath.c_str()))) {
+        selPath.clear();
         selPage = 0;
+        for (const auto& r : sections) {
+            if (r.get() == fw) continue;
+            int idx = 0;
+            if (const Section* f = FirstContentNode(*r, &idx)) {
+                selPath = RegistryPathOf(f);
+                selPage = idx;
+                ExpandAncestors(expanded, *f);
+                break;
+            }
+        }
     }
 
     // Footer band: both columns stop above it so the footer buttons stay
@@ -276,69 +429,72 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
 
     ImGui::BeginChild("##sections", ImVec2(190.0f, -footBand));
     RegistryResetSectionRects();
-    // Sidebar search: filters sections by (translated or raw) name substring;
-    // the current selection stays put even when filtered out.
+    // Sidebar search: filters whole subtrees by (translated or raw) name
+    // substring; while filtering everything renders expanded and the current
+    // selection stays put even when filtered out.
     static char search[64] = "";
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputTextWithHint("##search", i18n.T("search_hint"), search, sizeof(search));
-    int shownSections = 0;
+    TreeCtx tc;
+    tc.i18n = &i18n;
+    tc.search = search;
+    tc.selPath = &selPath;
+    tc.selPage = &selPage;
+    tc.selSettings = &selSettings;
+    tc.expanded = &expanded;
+    int visibleRoots = 0;
+    tc.visibleRoots = &visibleRoots;
     for (int i = 0; i < (int)sections.size(); ++i) {
         if (sections[i].get() == fw) continue;   // reached through the corner button
-        if (!SidebarFilterMatch(i18n.T(sections[i]->name.c_str()), search) &&
-            !SidebarFilterMatch(sections[i]->name.c_str(), search)) {
-            continue;
-        }
-        ++shownSections;
-        const bool sel = selSection == i;
-        if (sel) ImGui::PushStyleColor(ImGuiCol_Text, theme::kGoldBright);
-        if (ImGui::Selectable(i18n.T(sections[i]->name.c_str()), sel)) {
-            selSection = i;
-            selPage = 0;
-        }
-        if (sel) ImGui::PopStyleColor();
-        ImVec2 ra = ImGui::GetItemRectMin();
-        ImVec2 rb = ImGui::GetItemRectMax();
-        if (sel) {   // cinnabar accent bar, like the game's parry marks
-            ImGui::GetForegroundDrawList()->AddRectFilled(
-                ImVec2(ra.x, ra.y), ImVec2(ra.x + 3.0f, rb.y),
-                ImGui::GetColorU32(theme::kCinnabar));
-        }
-        float rect[4] = { ra.x, ra.y, rb.x, rb.y };
-        RegistryRecordSectionRect(i, rect);
+        tc.rootIdx = i;
+        RenderTreeNode(*sections[i], 0, tc);
     }
-    if (shownSections == 0) {
+    if (visibleRoots == 0) {
         ImGui::TextDisabled("-");
     }
     ImGui::EndChild();
     if (!s_frameworkRegistered) {
-        Log("[ui] frame 1: sidebar done (%d sections)", (int)sections.size());
+        Log("[ui] frame 1: sidebar done (%d root sections)", (int)sections.size());
     }
     ImGui::SameLine();
 
     ImGui::BeginChild("##content", ImVec2(0.0f, -footBand));
     ConfigDef* currentSchema = nullptr;
-    Section* sec = nullptr;
-    if (selSection == -1) {
-        sec = fw;
-    } else if (selSection >= 0 && selSection < (int)sections.size()) {
-        sec = sections[selSection].get();
+    Section* contentNode = nullptr;
+    int contentPage = 0;
+    if (selSettings) {
+        contentNode = fw;
+    } else if (!selPath.empty()) {
+        contentNode = RegistryFindPath(selPath.c_str());
+        contentPage = selPage;
     }
-    if (sec && !sec->pages.empty()) {
-        if (ImGui::BeginTabBar("##pages")) {
-            for (int p = 0; p < (int)sec->pages.size(); ++p) {
-                Page& pg = sec->pages[p];
-                if (ImGui::BeginTabItem(i18n.T(pg.label.c_str()))) {
-                    selPage = p;
-                    if (pg.schemaCfg) currentSchema = (ConfigDef*)pg.schemaCfg;
-                    if (pg.fn) {
-                        pg.fn(pg.ud);
-                    } else if (pg.schemaCfg) {
-                        RenderSchemaForm(*(ConfigDef*)pg.schemaCfg, i18n, dt);
+    if (contentNode && !contentNode->pages.empty()) {
+        if (contentPage < 0 || contentPage >= (int)contentNode->pages.size()) contentPage = 0;
+        Page& pg = contentNode->pages[contentPage];
+        if (pg.schemaCfg) currentSchema = (ConfigDef*)pg.schemaCfg;
+        if (contentNode->pages.size() > 1) {
+            // Rare v1 shape (several pages on one node): keep a local tab
+            // bar. The tree covers everything else.
+            if (ImGui::BeginTabBar("##pages")) {
+                for (int p = 0; p < (int)contentNode->pages.size(); ++p) {
+                    Page& tp = contentNode->pages[p];
+                    if (ImGui::BeginTabItem(i18n.T(tp.label.c_str()))) {
+                        selPage = p;
+                        if (tp.schemaCfg) currentSchema = (ConfigDef*)tp.schemaCfg;
+                        if (tp.fn) {
+                            tp.fn(tp.ud);
+                        } else if (tp.schemaCfg) {
+                            RenderSchemaForm(*(ConfigDef*)tp.schemaCfg, i18n, dt);
+                        }
+                        ImGui::EndTabItem();
                     }
-                    ImGui::EndTabItem();
                 }
+                ImGui::EndTabBar();
             }
-            ImGui::EndTabBar();
+        } else if (pg.fn) {
+            pg.fn(pg.ud);
+        } else if (pg.schemaCfg) {
+            RenderSchemaForm(*(ConfigDef*)pg.schemaCfg, i18n, dt);
         }
     } else {
         ImGui::TextDisabled("(no pages)");
@@ -349,10 +505,10 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
     // settings switch (gold while open) and save for the schema page being
     // viewed. Closing lives in the title bar (x / Esc / hotkey).
     ImGui::SetCursorPosX(st.WindowPadding.x);
-    const bool settingsOpen = selSection == -1;
+    const bool settingsOpen = selSettings;
     if (settingsOpen) ImGui::PushStyleColor(ImGuiCol_Text, theme::kGoldBright);
     if (ImGui::Button(i18n.T("page_settings"), ImVec2(150.0f, 0.0f))) {
-        selSection = -1;
+        selSettings = true;
         selPage = 0;
     }
     if (settingsOpen) ImGui::PopStyleColor();

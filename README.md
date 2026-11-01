@@ -6,12 +6,16 @@
 **快捷键呼出的游戏内设置界面**、多语言、以及可由框架统一编辑的模组配置（含键位）。
 模组如何注册自己的分区、设置页与热键，见《模组作者接入指南》。
 
-当前状态：**0.4.0**。输入方案与截图直通（0.2.0/0.3.3）已实机验证，机制与实机铁律
+当前状态：**0.5.0**。输入方案与截图直通（0.2.0/0.3.3）已实机验证，机制与实机铁律
 详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)；验证记录在
 [docs/VERIFIED.md](docs/VERIFIED.md)。0.4.0 是面向模组作者的一版（SDK API 版本 2）：
 
 - **ABI 兼容策略**：必需核心 + 可选导出。旧头文件配新框架继续工作，新功能在旧框架上
-  退化为 NULL 指针（判空调用），导出名与签名一旦发布永不更改（[sdk/pbzfm.h](sdk/pbzfm.h)）；
+  退化为 NULL 指针（判空调用），导出名与签名一旦发布永不更改（[sdk/pbzfm.h](sdk/pbzfm.h)，
+  API 版本 3）；
+- **分类树与嵌套路径**（0.5.0）：侧边栏按模组树形展开（单页模组仍是单行，会话内记忆
+  展开状态），模组用 `SetSectionPath` / `ConfigCreatePath` / `AddSectionItemPath` 以
+  `"我的模组/冻结方式"` 式路径声明任意层级分类，点分类右侧只显示该分类；
 - **菜单开关事件** \`OnMenuEvent\`（渲染线程，开/关各一次，免轮询）；
 - **热键与键位升级**：\`AddHotkeyEx\`/\`RemoveHotkey\` 组合键热键（修饰键严格匹配），
   schema 新增组合键键位捕获（\`ConfigAddKeyCombo\`，存储 vk | mods<<8）；
@@ -54,7 +58,7 @@ ctest --test-dir build   :: i18n 单测（也可手动跑 build\i18n_test.exe）
 ## 游戏内安装（用户用模组管理器自行完成，自动化不碰游戏目录）
 
 1. 安装 [UE4SS for PBZ](https://www.nexusmods.com/phantombladezero/mods/5)（KintaroModding fork）。
-2. 用模组管理器（或手动解压）把 `dist/PBZ-Framework-Menu_0.4.0.zip` 装到
+2. 用模组管理器（或手动解压）把 `dist/PBZ-Framework-Menu_0.5.0.zip` 装到
    `<游戏目录>\platform\steam\ue4ss\Mods\`，形成
    `ue4ss\Mods\PBZFM\{dlls\PBZFM.dll, enabled.txt, PBZFM.ini, languages\}`。
 3. 启动游戏按 F8；验证清单见包内 README.txt。排障先看 `Documents\PBZ\Logs\PBZFM.log`
@@ -103,5 +107,5 @@ docs/           架构与实机铁律 / 接入指南 / 验证记录 / 自测截�
    直接复用），顺带压测 SDK v2 的事件/纹理/生命周期路径。
 4. 参考项目已验证可行的后续方向：每模组翻译文件（languages/<store>.json，模组自带
    翻译不必等框架发版）、自定义字体文件夹 + 字形范围开关、呼出键模式（双击/长按 +
-   ConsumeToggleKey）、侧边栏分类/归档/排序、AddWindow / AddHudElement（不暂停小窗与
-   常驻 HUD 层）。
+   ConsumeToggleKey）、模组分组/归档/排序（0.5.0 已有分类树，模组组织仍开放）、
+   AddWindow / AddHudElement（不暂停小窗与常驻 HUD 层）。

@@ -1,7 +1,9 @@
 #pragma once
-// Section/page registry behind the PBZFM C API. Client mods register from
-// their own threads; the render thread iterates under the same recursive
-// mutex (registration blocks for at most one frame).
+// Section tree behind the PBZFM C API. A "section" is a sidebar tree node:
+// it carries pages (schema-backed or custom render callbacks) and can have
+// child sections (the 0.5.0 nested-path API). Client mods register from their
+// own threads; the render thread iterates under the same recursive mutex
+// (registration blocks for at most one frame).
 #include <memory>
 #include <mutex>
 #include <string>
@@ -18,23 +20,35 @@ struct Page {
     void* schemaCfg = nullptr;     // ConfigDef* when the page is schema-backed
 };
 
-struct Section {
-    std::string name;
-    std::vector<Page> pages;
+struct Section {                   // one sidebar tree node
+    std::string name;              // single path segment (no '/')
+    Section* parent = nullptr;     // null for roots
+    std::vector<Page> pages;       // content ON this node (usually 0 or 1)
+    std::vector<std::unique_ptr<Section>> children;
 };
 
 std::recursive_mutex& RegistryMutex();
-std::vector<std::unique_ptr<Section>>& RegistrySections();
-Section* RegistryGetOrCreateSection(const char* name_utf8);   // also makes it the calling thread's current
-Section* RegistryCurrentSection();                            // calling thread's current (may be null)
+std::vector<std::unique_ptr<Section>>& RegistrySections();   // roots
+Section* RegistryGetOrCreateSection(const char* name_utf8);  // v1: root by name; also sets it current
+Section* RegistryCurrentSection();                           // calling thread's current (may be null)
 void RegistryAddPage(Section* section, const Page& page);
 
-// Lifecycle (v2). Sections are identified by the name passed to SetSection.
-// Rename fails on a missing source or an existing target name; deleting a
-// section leaves its schema config stores untouched (files stay on disk).
-bool RegistryRenameSection(const char* old_utf8, const char* new_utf8);
-bool RegistryDeleteSection(const char* name_utf8);
-bool RegistryRemovePage(const char* section_utf8, const char* label_utf8);
+// Nested paths (v2/v3): "Mod/Category/Sub" - '/' separates segments, a
+// backslash escapes the next byte (a literal '/' in a segment is "\/").
+// Missing intermediates are created empty; the node at the path becomes the
+// calling thread's current section. RegistryFindPath only looks (used by the
+// renderer and by programmatic writes), it never creates.
+Section* RegistryGetOrCreatePath(const char* path_utf8);
+Section* RegistryFindPath(const char* path_utf8);
+std::string RegistryPathOf(const Section* node);   // escaped, '/'-joined
+
+// Lifecycle. Targets are PATHS (a single segment resolves to a root, which is
+// exactly the v1 name behavior). Rename renames the node's last segment and
+// fails on sibling collisions; deleting a node removes its whole subtree and
+// leaves schema config stores untouched (files stay on disk).
+bool RegistryRenameSection(const char* target_path, const char* new_name);
+bool RegistryDeleteSection(const char* target_path);
+bool RegistryRemovePage(const char* target_path, const char* label_utf8);
 
 // Hotkeys fire from the hook thread while the menu is closed, and stay live
 // (dispatch-then-swallow) while it is open. mods is a PBZFM_MOD_* bitmask and
@@ -54,8 +68,8 @@ int  RegistryAddMenuEvent(PBZFM_MenuEventFn fn, void* ud);
 void RegistryRemoveMenuEvent(int id);
 void RegistryDispatchMenuEvent(bool open);
 
-// Sidebar entry rects (overlay-client pixels), recorded by the menu each
-// frame and read by automation exports.
+// Sidebar entry rects (overlay-client pixels) for the ROOT rows, recorded by
+// the menu each frame and read by automation exports.
 void RegistryResetSectionRects();
 void RegistryRecordSectionRect(int index, const float xyxy[4]);
 int  RegistryGetSectionRect(int index, float out_xyxy[4]);

@@ -11,6 +11,7 @@ namespace pbzfm {
 
 class I18n;
 struct MenuUi;
+struct Section;
 
 enum SchemaType { SCH_GROUP = 0, SCH_BOOL = 1, SCH_INT = 2, SCH_FLOAT = 3, SCH_ENUM = 4, SCH_KEY = 5,
                   SCH_KEYCOMBO = 6 };   // v2: chord keybind, ival = vk | (mods << 8)
@@ -43,6 +44,8 @@ struct ConfigDef {
 // Creates a config + its auto-rendered page in the calling thread's current
 // section. Loads data/<store>.json when present.
 ConfigDef* SchemaCreateConfig(const char* store_utf8, const char* page_label_utf8);
+// Same, but the page lands on an explicit tree node (the nested-path API).
+ConfigDef* SchemaCreateConfigAt(Section* section, const char* store_utf8, const char* page_label_utf8);
 ConfigDef* SchemaValidate(void* handle);            // null when the handle is not a live config
 void SchemaSaveConfigNow(ConfigDef* cfg);           // immediate file write
 void SchemaSaveAllDirty();                          // called on menu close

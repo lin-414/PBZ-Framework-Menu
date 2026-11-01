@@ -6,11 +6,11 @@ namespace pbzfm {
 
 namespace {
 std::recursive_mutex g_mtx;
-std::vector<std::unique_ptr<Section>> g_sections;
-// Current section is tracked by NAME, not pointer: DeleteSection/RenameSection
-// can run on other threads and a raw pointer here would dangle. Resolution
-// happens on use, under the registry mutex.
-thread_local std::string tls_currentName;
+std::vector<std::unique_ptr<Section>> g_sections;   // roots
+// Current section is tracked by PATH, not pointer: DeleteSection /
+// RenameSection / tree edits can run on other threads and a raw pointer would
+// dangle. Resolution happens on use, under the registry mutex.
+thread_local std::string tls_currentPath;
 
 std::mutex g_hotkeyMtx;
 struct HotkeyEntry {
@@ -32,9 +32,71 @@ struct MenuEventEntry {
 std::vector<MenuEventEntry> g_events;
 int g_nextEventId = 1;
 
-// sidebar hit rects for automation (written by the render thread)
+// sidebar hit rects for automation (written by the render thread; ROOT rows)
 float g_sectionRects[32][4];
 int g_sectionRectCount = 0;
+
+// "A/B\/C" -> {"A", "B/C"}: '/' splits segments, a backslash escapes the next
+// byte so a literal '/' or '\' can live inside a segment. Empty segments are
+// dropped (tolerant of "A//B" and stray leading/trailing slashes).
+std::vector<std::string> SplitPath(const std::string& path) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (size_t i = 0; i < path.size(); ++i) {
+        char c = path[i];
+        if (c == '\\' && i + 1 < path.size()) { cur += path[++i]; continue; }
+        if (c == '/') {
+            if (!cur.empty()) out.push_back(cur);
+            cur.clear();
+            continue;
+        }
+        cur += c;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+std::string EscapeSegment(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        if (c == '/' || c == '\\') out += '\\';
+        out += c;
+    }
+    return out;
+}
+
+Section* FindChild(Section* parent, const std::string& name) {
+    if (parent) {
+        for (auto& c : parent->children) {
+            if (c->name == name) return c.get();
+        }
+        return nullptr;
+    }
+    for (auto& r : g_sections) {
+        if (r->name == name) return r.get();
+    }
+    return nullptr;
+}
+
+Section* CreateChild(Section* parent, const std::string& name) {
+    auto s = std::make_unique<Section>();
+    s->name = name;
+    s->parent = parent;
+    Section* raw = s.get();
+    if (parent) parent->children.push_back(std::move(s));
+    else g_sections.push_back(std::move(s));
+    return raw;
+}
+
+Section* FindPathLocked(const std::string& path) {
+    Section* cur = nullptr;
+    for (const std::string& seg : SplitPath(path)) {
+        cur = FindChild(cur, seg);
+        if (!cur) return nullptr;
+    }
+    return cur;
+}
+
 } // namespace
 
 void RegistryResetSectionRects() { g_sectionRectCount = 0; }
@@ -54,82 +116,115 @@ int RegistryGetSectionRect(int index, float out_xyxy[4]) {
 std::recursive_mutex& RegistryMutex() { return g_mtx; }
 std::vector<std::unique_ptr<Section>>& RegistrySections() { return g_sections; }
 
-Section* RegistryGetOrCreateSection(const char* name_utf8) {
+Section* RegistryGetOrCreatePath(const char* path_utf8) {
+    std::vector<std::string> segs = SplitPath(path_utf8 ? path_utf8 : "");
     std::lock_guard<std::recursive_mutex> lock(g_mtx);
-    for (auto& s : g_sections) {
-        if (s->name == name_utf8) {
-            tls_currentName = s->name;
-            return s.get();
+    Section* cur = nullptr;
+    std::string built;
+    for (const std::string& seg : segs) {
+        Section* next = FindChild(cur, seg);
+        if (!next) {
+            next = CreateChild(cur, seg);
+            Log("[api] section node created: %s%s%s", built.c_str(), built.empty() ? "" : "/",
+                EscapeSegment(seg).c_str());
         }
+        built = built.empty() ? EscapeSegment(seg) : built + "/" + EscapeSegment(seg);
+        cur = next;
     }
-    auto s = std::make_unique<Section>();
-    s->name = name_utf8 ? name_utf8 : "?";
-    Section* raw = s.get();
-    g_sections.push_back(std::move(s));
-    tls_currentName = raw->name;
-    Log("[api] section registered: %s", raw->name.c_str());
-    return raw;
+    if (!cur) return nullptr;
+    tls_currentPath = RegistryPathOf(cur);
+    return cur;
+}
+
+Section* RegistryFindPath(const char* path_utf8) {
+    std::lock_guard<std::recursive_mutex> lock(g_mtx);
+    return FindPathLocked(path_utf8 ? path_utf8 : "");
+}
+
+std::string RegistryPathOf(const Section* node) {
+    if (!node) return {};
+    std::lock_guard<std::recursive_mutex> lock(g_mtx);
+    std::vector<std::string> segs;
+    for (const Section* n = node; n; n = n->parent) segs.push_back(EscapeSegment(n->name));
+    std::string out;
+    for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
+        if (!out.empty()) out += '/';
+        out += *it;
+    }
+    return out;
+}
+
+Section* RegistryGetOrCreateSection(const char* name_utf8) {
+    // v1 entry point: a single-segment path, i.e. a root - exactly the old
+    // "root sections are unique by name" behavior.
+    return RegistryGetOrCreatePath(name_utf8);
 }
 
 Section* RegistryCurrentSection() {
     std::lock_guard<std::recursive_mutex> lock(g_mtx);
-    if (tls_currentName.empty()) return nullptr;
-    for (auto& s : g_sections) {
-        if (s->name == tls_currentName) return s.get();
-    }
-    return nullptr;   // renamed or deleted out from under this thread
+    if (tls_currentPath.empty()) return nullptr;
+    return FindPathLocked(tls_currentPath);
 }
 
 void RegistryAddPage(Section* section, const Page& page) {
     if (!section) return;
     std::lock_guard<std::recursive_mutex> lock(g_mtx);
     section->pages.push_back(page);
-    Log("[api] page registered: %s / %s%s", section->name.c_str(), page.label.c_str(),
+    Log("[api] page registered: %s / %s%s", RegistryPathOf(section).c_str(), page.label.c_str(),
         page.schemaCfg ? " (schema)" : " (custom)");
 }
 
-bool RegistryRenameSection(const char* old_utf8, const char* new_utf8) {
-    if (!old_utf8 || !new_utf8 || !*new_utf8) return false;
+bool RegistryRenameSection(const char* target_path, const char* new_name) {
+    if (!target_path || !new_name || !*new_name) return false;
+    if (strchr(new_name, '/')) return false;   // a name is a single segment
     std::lock_guard<std::recursive_mutex> lock(g_mtx);
-    Section* target = nullptr;
-    for (auto& s : g_sections) {
-        if (s->name == old_utf8) { target = s.get(); break; }
+    Section* node = FindPathLocked(target_path);
+    if (!node) return false;
+    Section* sib = node->parent;   // null sibling list = roots
+    auto clash = [&](const std::unique_ptr<Section>& s) {
+        return s.get() != node && s->name == new_name;
+    };
+    if (sib) {
+        for (auto& c : sib->children) if (clash(c)) return false;
+    } else {
+        for (auto& r : g_sections) if (clash(r)) return false;
     }
-    if (!target) return false;
-    for (auto& s : g_sections) {
-        if (s.get() != target && s->name == new_utf8) return false;   // collision
-    }
-    Log("[api] section renamed: %s -> %s", target->name.c_str(), new_utf8);
-    target->name = new_utf8;
+    Log("[api] section renamed: %s -> %s", RegistryPathOf(node).c_str(), new_name);
+    node->name = new_name;
     return true;
 }
 
-bool RegistryDeleteSection(const char* name_utf8) {
-    if (!name_utf8) return false;
+bool RegistryDeleteSection(const char* target_path) {
+    if (!target_path) return false;
     std::lock_guard<std::recursive_mutex> lock(g_mtx);
-    for (auto it = g_sections.begin(); it != g_sections.end(); ++it) {
-        if ((*it)->name == name_utf8) {
-            Log("[api] section deleted: %s (%zu pages)", name_utf8, (*it)->pages.size());
-            g_sections.erase(it);
-            return true;
+    Section* node = FindPathLocked(target_path);
+    if (!node) return false;
+    Log("[api] section deleted: %s (pages=%zu children=%zu)", RegistryPathOf(node).c_str(),
+        node->pages.size(), node->children.size());
+    if (node->parent) {
+        auto& v = node->parent->children;
+        for (auto it = v.begin(); it != v.end(); ++it) {
+            if (it->get() == node) { v.erase(it); return true; }
         }
+        return false;
+    }
+    for (auto it = g_sections.begin(); it != g_sections.end(); ++it) {
+        if (it->get() == node) { g_sections.erase(it); return true; }
     }
     return false;
 }
 
-bool RegistryRemovePage(const char* section_utf8, const char* label_utf8) {
-    if (!section_utf8 || !label_utf8) return false;
+bool RegistryRemovePage(const char* target_path, const char* label_utf8) {
+    if (!target_path || !label_utf8) return false;
     std::lock_guard<std::recursive_mutex> lock(g_mtx);
-    for (auto& s : g_sections) {
-        if (s->name != section_utf8) continue;
-        for (auto p = s->pages.begin(); p != s->pages.end(); ++p) {
-            if (p->label == label_utf8) {
-                Log("[api] page removed: %s / %s", section_utf8, label_utf8);
-                s->pages.erase(p);
-                return true;
-            }
+    Section* node = FindPathLocked(target_path);
+    if (!node) return false;
+    for (auto p = node->pages.begin(); p != node->pages.end(); ++p) {
+        if (p->label == label_utf8) {
+            Log("[api] page removed: %s / %s", RegistryPathOf(node).c_str(), label_utf8);
+            node->pages.erase(p);
+            return true;
         }
-        return false;
     }
     return false;
 }

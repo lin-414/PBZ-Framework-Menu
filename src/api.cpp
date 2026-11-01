@@ -60,6 +60,31 @@ __declspec(dllexport) int PBZFM_RemoveSectionItem(const char* section_utf8, cons
     return RegistryRemovePage(section_utf8, label_utf8) ? 1 : 0;
 }
 
+// ---- nested paths (v3) ----
+
+__declspec(dllexport) void PBZFM_SetSectionPath(const char* path_utf8) {
+    if (!path_utf8) return;
+    RegistryGetOrCreatePath(path_utf8);   // creates missing intermediates + sets current
+}
+
+__declspec(dllexport) void PBZFM_AddSectionItemPath(const char* path_utf8, PBZFM_RenderFn fn, void* userdata) {
+    if (!path_utf8 || !fn) return;
+    Section* s = RegistryGetOrCreatePath(path_utf8);
+    if (!s) return;
+    Page p;
+    p.label = s->name;   // the last path segment names the content row
+    p.fn = fn;
+    p.ud = userdata;
+    RegistryAddPage(s, p);
+}
+
+__declspec(dllexport) PBZFM_Config PBZFM_ConfigCreatePath(const char* store_utf8, const char* path_utf8) {
+    if (!path_utf8) return nullptr;
+    Section* s = RegistryGetOrCreatePath(path_utf8);
+    if (!s) return nullptr;
+    return (PBZFM_Config)SchemaCreateConfigAt(s, store_utf8, s->name.c_str());
+}
+
 // ---- schema ----
 
 __declspec(dllexport) PBZFM_Config PBZFM_ConfigCreate(const char* store_utf8, const char* page_label_utf8) {
