@@ -48,13 +48,15 @@ namespace {
 
 using namespace RC::Unreal;
 
-// 0 = 无请求；1 = 菜单打开（冻结）；-1 = 菜单关闭（恢复）
+// 0 = 无请求；1 = 菜单打开（冻结）；-1 = 菜单关闭（恢复）；2 = 重新施加冻结
 std::atomic<int> g_request{ 0 };
 bool g_frozen = false;          // 游戏线程私有
 bool g_shutdown = false;
 bool g_loggedFailure = false;
+ULONGLONG g_lastEnsureMs = 0;   // 上次读回校验的时间（兜底轮询用）
 
 UObject* g_pc = nullptr;        // 仅游戏线程访问
+UObject* g_pawn = nullptr;      // 当前被我们屏蔽过 bBlockInput 的 Pawn（换代要重写）
 bool g_blockWrotePc = false, g_blockOrigPc = false;
 bool g_blockWrotePawn = false, g_blockOrigPawn = false;
 bool g_cursorWrote = false, g_cursorOrig = false;
@@ -155,6 +157,14 @@ bool WriteBool(UObject* owner, const char* name, bool value, bool* prev) {
     return true;
 }
 
+// 读一个 bool 属性（用于判断游戏有没有把我们的冻结重置掉）
+bool ReadBool(UObject* owner, const char* name, bool& out) {
+    FProperty* prop = FindProperty(owner, name);
+    if (prop == nullptr || !prop->IsA<FBoolProperty>()) return false;
+    out = static_cast<FBoolProperty*>(prop)->GetPropertyValueInContainer(owner);
+    return true;
+}
+
 // 调 void SetXxxInput(bool)：按参数名找属性、写值、ProcessEvent
 bool InvokeBoolSetter(UObject* owner, const char* functionName, const char* paramName, bool value) {
     if (!IsOk(owner)) return false;
@@ -210,7 +220,8 @@ bool Freeze() {
     // 只记录自己写成功的位，恢复时按位还原，不覆盖游戏自己设的值。
     g_blockWrotePc = WriteBool(g_pc, "bBlockInput", true, &g_blockOrigPc);
     UObject* pawn = ReadObjectProperty(g_pc, "Pawn");
-    if (IsOk(pawn)) g_blockWrotePawn = WriteBool(pawn, "bBlockInput", true, &g_blockOrigPawn);
+    g_pawn = IsOk(pawn) ? pawn : nullptr;
+    if (g_pawn != nullptr) g_blockWrotePawn = WriteBool(g_pawn, "bBlockInput", true, &g_blockOrigPawn);
     const bool move = InvokeBoolSetter(g_pc, "SetIgnoreMoveInput", "bNewMoveInput", true);
     const bool look = InvokeBoolSetter(g_pc, "SetIgnoreLookInput", "bNewLookInput", true);
     g_ignoreWrote = move || look;
@@ -221,9 +232,50 @@ bool Freeze() {
         return false;
     }
     g_frozen = true;
+    g_lastEnsureMs = GetTickCount64();
     Log("[engine] menu open - frozen (bBlockInput=%d ignore=%d cursor=%d)",
         (int)g_blockWrotePc, (int)g_ignoreWrote, (int)g_cursorWrote);
     return true;
+}
+
+// 读回校验 + 补写：游戏在窗口重新激活时会重建输入栈（本作实机：N 卡浮层抢焦点
+// 回来后左键漏给 PBZPhotoMode），所以冻结不能只做一次。
+void EnsureFrozen() {
+    if (!g_frozen) return;
+    g_lastEnsureMs = GetTickCount64();
+
+    if (!IsOk(g_pc)) {
+        // PC 换代/失效：旧指针上写的位已经没有意义，按新对象重新冻结。
+        g_pc = FindPlayerController();
+        if (!IsOk(g_pc)) return;
+        g_blockWrotePc = g_blockWrotePawn = g_cursorWrote = g_ignoreWrote = false;
+        g_pawn = nullptr;
+        g_frozen = false;
+        Freeze();
+        return;
+    }
+
+    bool blocked = false;
+    if (g_blockWrotePc && ReadBool(g_pc, "bBlockInput", blocked) && !blocked) {
+        WriteBool(g_pc, "bBlockInput", true, nullptr);
+        Log("[engine] re-asserted bBlockInput (the game reset it)");
+    }
+
+    // Pawn 换代（死亡/重生/切图）：旧 Pawn 的还原值不再适用，按新 Pawn 重写。
+    UObject* pawn = ReadObjectProperty(g_pc, "Pawn");
+    if (IsOk(pawn) && pawn != g_pawn) {
+        if (g_blockWrotePawn && IsOk(g_pawn)) WriteBool(g_pawn, "bBlockInput", g_blockOrigPawn, nullptr);
+        g_blockOrigPawn = false;
+        g_blockWrotePawn = WriteBool(pawn, "bBlockInput", true, &g_blockOrigPawn);
+        g_pawn = pawn;
+    }
+
+    // 轴屏蔽没有可读回的等效属性，直接重写（5Hz × 两次 ProcessEvent，可忽略）。
+    if (g_ignoreWrote) {
+        InvokeBoolSetter(g_pc, "SetIgnoreMoveInput", "bNewMoveInput", true);
+        InvokeBoolSetter(g_pc, "SetIgnoreLookInput", "bNewLookInput", true);
+    }
+    if (g_cursorWrote) WriteBool(g_pc, "bShowMouseCursor", true, nullptr);
 }
 
 void Unfreeze() {
@@ -239,6 +291,7 @@ void Unfreeze() {
         if (g_cursorWrote) WriteBool(g_pc, "bShowMouseCursor", g_cursorOrig, nullptr);
     }
     g_blockWrotePc = g_blockWrotePawn = g_cursorWrote = g_ignoreWrote = false;
+    g_pawn = nullptr;
     g_frozen = false;
     Log("[engine] menu closed - input restored");
 }
@@ -251,7 +304,11 @@ void OnEngineTick() {
         Freeze();
     } else if (req < 0) {
         Unfreeze();
+    } else if (req == 2) {
+        EnsureFrozen();
     }
+    // 兜底轮询：200ms 读回一次，游戏重置就立刻补回来（焦点回归另有即时触发）。
+    if (g_frozen && GetTickCount64() - g_lastEnsureMs >= 200) EnsureFrozen();
 }
 
 bool Init(const char** why) {
@@ -290,7 +347,13 @@ void OnMenuOpen(bool open) {
     g_request.store(open ? 1 : -1, std::memory_order_release);
 }
 
-const EngineBackend kBackend{ "ue4ss", &Init, &Shutdown, &OnMenuOpen };
+// 焦点回归：游戏可能刚把输入栈重建过，立刻在下一次 tick 补一次冻结。
+void OnReassert() {
+    if (!g_frozen) return;
+    g_request.store(2, std::memory_order_release);
+}
+
+const EngineBackend kBackend{ "ue4ss", &Init, &Shutdown, &OnMenuOpen, &OnReassert };
 
 } // namespace
 

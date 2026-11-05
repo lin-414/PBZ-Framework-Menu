@@ -178,13 +178,17 @@ LRESULT CALLBACK OverlayWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 // dead until restart, verified in-game 2026-11-01).
 bool RawMouseIsOurs();   // defined below; the steal checks ownership first
 
-bool StealGameRawMouse() {
+// 方案 C 之后这个函数也用在引擎模式：Raw Input 注册是**进程级**的，改指向不会
+// 影响系统输入流（录屏/截图热键照常），但能挡住"绕过 PlayerController 直接读
+// Raw Input 的输入"—— PBZPhotoMode 的镜头/动作就是这样读的，光靠引擎冻结挡不住。
+// 引擎模式下额外把键盘 entry 也改指向覆盖窗：游戏与其它模组的 Raw 键盘一起断掉。
+bool StealGameRawInput() {
     // H1: never save an already-stolen list as "the game's". If our sink is
     // still current, re-stealing would capture OUR entry into rawList and the
     // close-time restore would re-register our own sink instead of the game's
     // (camera dead until restart).
     if (RawMouseIsOurs()) {
-        Log("[ov] raw mouse already points at the overlay - steal skipped");
+        Log("[ov] raw input already points at the overlay - steal skipped");
         return true;
     }
 
@@ -200,40 +204,59 @@ bool StealGameRawMouse() {
     }
     saved.resize(got);
 
+    // H1 的键盘版：绝不允许把我们自己的 sink 写进还原表。鼠标被游戏重注册、
+    // 而我们上一轮的键盘 sink 还活着时，天真的"存下来"会让关闭时把我们的 sink
+    // 再注册回去（游戏键盘从此失效）。这里先把自己名下的条目录掉再保存。
+    const size_t before = saved.size();
+    saved.erase(std::remove_if(saved.begin(), saved.end(),
+                   [](const RAWINPUTDEVICE& d) { return d.hwndTarget == g_ov.hwnd; }),
+                saved.end());
+    if (saved.size() != before) {
+        Log("[ov] raw input: dropped %u of our own sink entries before saving the restore list",
+            (unsigned)(before - saved.size()));
+    }
+
     RAWINPUTDEVICE ours{};
     ours.usUsagePage = 0x01;
-    ours.usUsage = 0x02;
-    ours.dwFlags = RIDEV_INPUTSINK;   // deliver even though the game keeps focus
+    ours.usUsage = 0x02;               // mouse
+    ours.dwFlags = RIDEV_INPUTSINK;    // deliver even though the game keeps focus
     ours.hwndTarget = g_ov.hwnd;
+    RAWINPUTDEVICE oursKb = ours;
+    oursKb.usUsage = 0x06;             // keyboard
 
     std::vector<RAWINPUTDEVICE> next;
-    bool hadMouse = false;
+    bool hadMouse = false, hadKeyboard = false;
     for (const RAWINPUTDEVICE& d : saved) {
-        if (d.usUsagePage == ours.usUsagePage && d.usUsage == ours.usUsage) {
-            next.push_back(ours);   // re-point the game's mouse entry at us
+        if (d.usUsagePage == 0x01 && d.usUsage == 0x02) {
+            next.push_back(ours);      // re-point the game's mouse entry at us
             hadMouse = true;
+        } else if (d.usUsagePage == 0x01 && d.usUsage == 0x06) {
+            next.push_back(oursKb);    // re-point the game's keyboard entry at us
+            hadKeyboard = true;
         } else {
-            next.push_back(d);      // keyboard/gamepad entries survive verbatim
+            next.push_back(d);         // gamepad / consumer-control entries survive verbatim
         }
     }
     if (!hadMouse) next.push_back(ours);
+    if (!hadKeyboard) next.push_back(oursKb);
 
     if (!RegisterRawInputDevices(next.data(), (UINT)next.size(), sizeof(RAWINPUTDEVICE))) {
         // H1: a failed steal leaves the process-wide registration exactly as it
         // was. Record that so close does NOT run the "remove our sink" branch
         // (which would delete the game's live entry).
-        Log("[ov] ERROR: raw mouse re-point failed err=%lu - game input untouched", GetLastError());
+        Log("[ov] ERROR: raw input re-point failed err=%lu - game input untouched", GetLastError());
         g_ov.rawState = kRawStealFailed;
         return false;
     }
     g_ov.rawList = std::move(saved);
     g_ov.rawState = hadMouse ? kRawStolenWithGameEntry : kRawStolenOnlyOurs;
-    Log("[ov] raw mouse re-pointed to overlay (%u entries saved, state=%s)", (unsigned)got,
+    Log("[ov] raw input re-pointed to overlay (%u entries saved, mouse=%u keyboard=%u, state=%s)",
+        (unsigned)got, (unsigned)hadMouse, (unsigned)hadKeyboard,
         hadMouse ? "with-game-entry" : "only-ours");
     return true;
 }
 
-void RestoreGameRawMouse() {
+void RestoreGameRawInput() {
     // H1: a failed steal must never trigger a restore - the game's registration
     // was never replaced, so any registration call here could only damage it.
     if (g_ov.rawState == kRawStealFailed) {
@@ -272,19 +295,21 @@ void RestoreGameRawMouse() {
         return;
     }
     if (g_ov.rawState == kRawStolenOnlyOurs) {
-        // Nothing existed before us, so removing our sink returns the process to
+        // Nothing existed before us, so removing our sinks returns the process to
         // that exact state. Safe ONLY because RawMouseIsOurs() above confirmed
-        // the live entry is still the one we registered.
-        RAWINPUTDEVICE rm{};
-        rm.usUsagePage = 0x01;
-        rm.usUsage = 0x02;
-        rm.dwFlags = RIDEV_REMOVE;
-        rm.hwndTarget = nullptr;
-        if (!RegisterRawInputDevices(&rm, 1, sizeof(rm))) {
+        // the live entries are still the ones we registered.
+        RAWINPUTDEVICE rm[2]{};
+        rm[0].usUsagePage = 0x01;
+        rm[0].usUsage = 0x02;
+        rm[0].dwFlags = RIDEV_REMOVE;
+        rm[0].hwndTarget = nullptr;
+        rm[1] = rm[0];
+        rm[1].usUsage = 0x06;   // 键盘 sink 也是我们加的，一起摘掉
+        if (!RegisterRawInputDevices(rm, 2, sizeof(RAWINPUTDEVICE))) {
             Log("[ov] ERROR: raw sink removal failed err=%lu", GetLastError());
             return;
         }
-        Log("[ov] raw mouse sink removed (no game entry existed before the steal)");
+        Log("[ov] raw input sinks removed (no game entry existed before the steal)");
         g_ov.rawState = kRawNotStolen;
         return;
     }
@@ -294,13 +319,13 @@ void RestoreGameRawMouse() {
 }
 
 // True while the process-wide mouse raw-input entry still points at our
-// overlay. Never re-steal while it returns true: StealGameRawMouse saves the
+// overlay. Never re-steal while it returns true: StealGameRawInput saves the
 // list it sees as the restore state, and seeing our own entry there would
 // make close-time restore re-register OUR registration instead of the game's
 // (camera dead until restart, the exact failure the save/restore exists for).
 bool RawMouseIsOurs() {
     // The NULL-buffer count query returns FALSE even when it fills n (probed
-    // 2026-11-01): ignore the return and trust n, mirroring StealGameRawMouse.
+    // 2026-11-01): ignore the return and trust n, mirroring StealGameRawInput.
     UINT n = 0;
     GetRegisteredRawInputDevices(nullptr, &n, sizeof(RAWINPUTDEVICE));
     std::vector<RAWINPUTDEVICE> list(n);
@@ -777,17 +802,23 @@ void RenderFrame() {
     // ahead of us in the LL chain. The 4 Hz poll covers re-registrations
     // without an activation edge (Steam Input does this at any time).
     bool gameFg = g_ov.gw->hwnd && GetForegroundWindow() == g_ov.gw->hwnd;
-    if (gameFg && !g_ov.gameWasFg && !EnginePortActive()) {
-        InputRehook();
-        g_ov.gw->UnclipCursor();
+    if (gameFg && !g_ov.gameWasFg) {
+        // LL 钩子链插队与解除裁剪只在 OS 模式有意义；引擎模式两者都不存在。
+        if (!EnginePortActive()) {
+            InputRehook();
+            g_ov.gw->UnclipCursor();
+        }
+        // Raw Input 改指向两种模式都要重抢：游戏重新激活时会重注册，
+        // 断掉后相机/动作才不会被 Raw 输入绕过（进程级，不影响系统热键）。
         bool restolen = !RawMouseIsOurs();
-        if (restolen) StealGameRawMouse();
-        Log("[ov] game regained foreground - rehook + unclip%s", restolen ? " + raw re-steal" : "");
+        if (restolen) StealGameRawInput();
+        Log("[ov] game regained foreground - %sraw re-steal%s", restolen ? "" : "no ",
+            EnginePortActive() ? " (engine mode)" : " + rehook + unclip");
     }
     g_ov.gameWasFg = gameFg;
-    if (!EnginePortActive() && now.QuadPart >= g_ov.rawWatchNext.QuadPart) {
+    if (now.QuadPart >= g_ov.rawWatchNext.QuadPart) {
         g_ov.rawWatchNext.QuadPart = now.QuadPart + g_ov.qpcFreq.QuadPart / 4;
-        if (!RawMouseIsOurs()) StealGameRawMouse();
+        if (!RawMouseIsOurs()) StealGameRawInput();
     }
 
     InputEvent ev;
@@ -1014,10 +1045,15 @@ void SetVisible(bool v) {
         ShowWindow(g_ov.hwnd, SW_SHOWNA);
         if (EnginePortActive()) {
             // 方案 C：引擎后端负责冻结 look/move 和显示光标（真正的引擎调用
-            // 在游戏线程执行）。这里绝不碰 Raw Input、不动 ShowCursor 计数、
-            // 不解除游戏的 ClipCursor —— 系统输入流保持原样，录屏/截图热键不受影响。
+            // 在游戏线程执行）。不碰 ShowCursor 计数、不解除游戏的 ClipCursor。
+            //
+            // 但 Raw Input 改指向仍然要做：它是**进程级**的，不影响系统输入流
+            // （录屏/截图热键照常），却能挡住绕过 PlayerController 直接读 Raw 的
+            // 输入 —— PBZPhotoMode 的镜头/动作就是这条路径，只靠引擎冻结挡不住
+            // （实机 2026-11-05：N 卡浮层抢焦点回来后左键漏给了 PhotoMode）。
             EnginePortSetMenuOpen(true);
             g_ov.cursorHiddenByUs = false;
+            StealGameRawInput();
             ImGui::GetIO().MouseDrawCursor = false;   // 系统光标由引擎显示，不画第二个
             // 没有钩子就没有"第一次移动"事件：先按当前光标位置播种一次，
             // 否则 ImGui 的 MousePos 会停在 -FLT_MAX，菜单要等鼠标动一下才能点。
@@ -1036,7 +1072,7 @@ void SetVisible(bool v) {
                 g_ov.cursorHiddenByUs = false;
             }
             g_ov.gw->UnclipCursor();
-            StealGameRawMouse();
+            StealGameRawInput();
             // The cursor sits over OUR overlay window, so its visibility follows
             // THIS thread's ShowCursor count - hiding it here never touches the
             // game's own bookkeeping (the game-thread drain wedged the game's
@@ -1070,11 +1106,12 @@ void SetVisible(bool v) {
         ShowWindow(g_ov.hwnd, SW_HIDE);
         ImGui::GetIO().MouseDrawCursor = false;
         if (EnginePortActive()) {
-            // 方案 C：由引擎线程解冻并恢复光标，这里不做任何 OS 级恢复动作。
+            // 方案 C：引擎线程解冻并恢复光标；Raw Input 注册表必须还原成游戏原来的样子。
             EnginePortSetMenuOpen(false);
             g_ov.cursorHiddenByUs = false;
+            RestoreGameRawInput();
         } else {
-            RestoreGameRawMouse();
+            RestoreGameRawInput();
             ShowCursor(TRUE);   // our queue: back to 0 (visible), exact undo of the open drain
         }
         // L2: a key/button held while the menu is toggled off never produces a

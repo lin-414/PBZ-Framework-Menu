@@ -9,10 +9,25 @@
 
 | 子系统 | 谁负责 | 说明 |
 | --- | --- | --- |
-| 冻结游戏输入（键鼠动作 / 移动轴 / 视角轴） | **引擎后端** | 只在游戏线程调用，天然只影响本进程 |
-| 菜单的键鼠事件采集 | **窗口消息**（覆盖窗 + 游戏窗口子类） | 本作是 Enhanced Input，`PlayerController` 上没有可钩的 `InputKey`/`InputAxis`（PBZPhotoMode 实机结论）；引擎侧逐键轮询要每帧上百次 `ProcessEvent`，不划算也不可靠 |
+| 冻结游戏输入（键鼠动作 / 移动轴 / 视角轴） | **引擎后端** | 只在游戏线程调用，天然只影响本进程；**每 200ms 读回校验并补写**，焦点回归时立刻补一次（游戏会重建输入栈） |
+| 切断绕过 PlayerController 的输入 | **进程级 Raw Input 改指向**（鼠标 + 键盘） | 只影响本进程，系统输入流仍不动；挡住 PBZPhotoMode 这类直接读 Raw/钩子的模组 |
+| 菜单的键鼠事件采集 | **窗口消息**（覆盖窗 + 游戏窗口子类） | 本作是 Enhanced Input，`PlayerController` 上没有可钩的 `InputKey`/`InputAxis`；引擎侧逐键轮询要每帧上百次 `ProcessEvent`，不划算也不可靠 |
 | 光标 | **引擎后端**（`bShowMouseCursor`） | ImGui 不再自绘光标，避免双光标 |
-| 全局热键 / 录屏 | **不再被碰** | 模块不再安装任何 `WH_KEYBOARD_LL` / `WH_MOUSE_LL`，不再改 Raw Input |
+| 全局热键 / 录屏 | **不再被碰** | 模块不再安装任何 `WH_KEYBOARD_LL` / `WH_MOUSE_LL` |
+
+### 为什么冻结不是"一次性"的
+
+实机 2026-11-05：菜单开着时按 N 卡快捷键呼出浮层，浮层抢走焦点，回来后**左键漏给了
+PBZPhotoMode（触发上升）**。日志显示 `menu open - frozen (bBlockInput=1 ignore=1 cursor=1)`
+只出现一次，之后 11 分钟没有任何补写 —— 游戏在窗口重新激活时会重建输入栈/重置
+`bBlockInput`，一次性冻结就此失效。
+
+现在的做法：
+- `WM_ACTIVATE`/`WM_SETFOCUS` → `EnginePortReassert()`，下一个 tick 立刻补；
+- 游戏线程每 200ms 读回 `bBlockInput`，发现被重置就重写并记
+  `[engine] re-asserted bBlockInput (the game reset it)`；
+- Pawn 换代时重新屏蔽新 Pawn；PC 失效时重新 Find 并整套重来；
+- 同时把进程级 Raw Input 的鼠标+键盘都改指向覆盖窗，堵住"绕过引擎直接读 Raw"的路径。
 
 也就是说：方案 C 负责「冻结」，窗口消息通道负责「取输入」。两者合起来
 才是完整的零 OS 侵入方案。

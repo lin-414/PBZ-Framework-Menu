@@ -43,6 +43,10 @@ struct EngineBackend {
     bool (*init)(const char** why);
     void (*shutdown)();
     void (*menuOpen)(bool open);
+    // 重新施加冻结。游戏在窗口重新激活时可能重置 bBlockInput / 输入栈
+    // （本作实机现象：N 卡浮层抢焦点回来后，左键会漏给 PBZPhotoMode），
+    // 所以焦点回归时立刻补一次，游戏线程里另有 200ms 的兜底轮询。
+    void (*reassert)();
 };
 
 // ---- 框架侧状态机 ----------------------------------------------------------
@@ -59,5 +63,9 @@ const char* EnginePortUnavailableReason();
 // 菜单开/关：引擎模式下转发给后端（冻结 look/move、显示光标、切 UI 输入模式）。
 // OS 模式下它是空操作。
 void EnginePortSetMenuOpen(bool open);
+
+// 请求在下一次游戏线程 tick 重新施加冻结（菜单开着时才有效）。
+// 触发点：游戏窗口重新激活（WM_ACTIVATE）、以及 200ms 兜底轮询。
+void EnginePortReassert();
 
 } // namespace pbzfm

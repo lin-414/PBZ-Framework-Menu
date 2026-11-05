@@ -62,6 +62,13 @@ LRESULT CALLBACK GameWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     // 其余原样放行 —— 系统热键（录屏/截图/游戏栏）因此不受任何影响。
     if (EnginePortActive()) {
         switch (msg) {
+            // 游戏重新激活/拿到焦点：本作会重建输入栈（实机：N 卡浮层抢焦点回来后，
+            // 左键会漏给 PBZPhotoMode）。这里立刻请求引擎线程补一次冻结；菜单没开时是空操作。
+            // 必须原样放行给游戏，否则它自己的激活逻辑会丢。
+            case WM_ACTIVATE:
+            case WM_SETFOCUS:
+                if (msg == WM_SETFOCUS || LOWORD(w) != WA_INACTIVE) EnginePortReassert();
+                return CallWindowProc(g_origProc ? g_origProc : DefWindowProcW, h, msg, w, l);
             case WM_KEYDOWN:
             case WM_SYSKEYDOWN:
             case WM_KEYUP:

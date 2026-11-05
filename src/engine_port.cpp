@@ -135,4 +135,11 @@ void EnginePortSetMenuOpen(bool open) {
     }
 }
 
+void EnginePortReassert() {
+    if (!g_active.load(std::memory_order_acquire)) return;
+    if (const EngineBackend* b = EngineBackendGet()) {
+        if (b->reassert) b->reassert();
+    }
+}
+
 } // namespace pbzfm
