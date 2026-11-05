@@ -645,6 +645,42 @@ void InputClearPendingMoves() {
 
 void InputPushEvent(const InputEvent& e) { Push(e); }
 
+// ---- 方案 C：窗口消息输入通道 ---------------------------------------------
+// 与钩子路径共用同一条队列；区别只是事件来源从 LL 钩子换成窗口消息。
+void InputPushKeyVk(unsigned vk, bool down) {
+    int ik = VkToImGuiKey(vk);
+    if (ik == ImGuiKey_None) return;
+    InputEvent e{};
+    e.type = InputEvent::Key;
+    e.key = ik;
+    e.down = down;
+    Push(e);
+}
+
+void InputPushMouseButton(int button, bool down) {
+    if (button < 0 || button >= ImGuiMouseButton_COUNT) return;
+    InputEvent e{};
+    e.type = InputEvent::Btn;
+    e.key = button;
+    e.down = down;
+    Push(e);
+}
+
+void InputPushWheel(float dy) {
+    InputEvent e{};
+    e.type = InputEvent::Wheel;
+    e.wy = dy;
+    Push(e);
+}
+
+void InputPushMoveScreen(int screenX, int screenY) {
+    InputEvent e{};
+    e.type = InputEvent::Move;
+    e.wx = (float)screenX;
+    e.wy = (float)screenY;
+    Push(e);
+}
+
 void InputSetPassthrough(const std::vector<HotkeyChord>& chords, bool replay) {
     {
         AcquireSRWLockExclusive(&g_ptLock);

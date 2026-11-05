@@ -1,5 +1,7 @@
 #include "game_window.h"
 #include "common.h"
+#include "engine_port.h"
+#include "input.h"
 
 namespace pbzfm {
 
@@ -53,6 +55,56 @@ LRESULT CALLBACK GameWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         if (orig && IsWindow(target)) SetWindowLongPtrW(target, GWLP_WNDPROC, (LONG_PTR)orig);
         return 0;
     }
+
+    // ---- 方案 C：引擎模式的键盘通道 ----------------------------------------
+    // 引擎模式不装全局钩子；但游戏窗口仍是前台窗口（覆盖窗是 WS_EX_NOACTIVATE），
+    // 所以按键消息一定经过这里。菜单开着时吞掉并喂给 ImGui，关着时只认呼出键，
+    // 其余原样放行 —— 系统热键（录屏/截图/游戏栏）因此不受任何影响。
+    if (EnginePortActive()) {
+        switch (msg) {
+            case WM_KEYDOWN:
+            case WM_SYSKEYDOWN:
+            case WM_KEYUP:
+            case WM_SYSKEYUP: {
+                const unsigned vk = (unsigned)w;
+                const bool down = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN);
+                const bool menuOpen = g_menuOpen.load(std::memory_order_relaxed);
+
+                if (vk == g_toggleVk.load(std::memory_order_relaxed)) {
+                    if (down) {
+                        if (menuOpen) g_closeRequest.store(true, std::memory_order_release);
+                        else g_wantToggle.store(true, std::memory_order_release);
+                    }
+                    return 0;
+                }
+                if (!menuOpen) return CallWindowProc(g_origProc ? g_origProc : DefWindowProcW, h, msg, w, l);
+
+                // 键位捕获（设置页点组合键后等一次真实按键）：钩子路径在 KbProc 里做，
+                // 这里等价实现，捕获态优先于喂菜单。
+                if (g_captureMode.load(std::memory_order_relaxed) == 1) {
+                    const bool modifier = (vk >= VK_SHIFT && vk <= VK_MENU) || vk == VK_LWIN || vk == VK_RWIN;
+                    if (down && !modifier) {
+                        unsigned mods = 0;
+                        if (GetAsyncKeyState(VK_CONTROL) & 0x8000) mods |= 0x1u;
+                        if (GetAsyncKeyState(VK_SHIFT) & 0x8000) mods |= 0x2u;
+                        if (GetAsyncKeyState(VK_MENU) & 0x8000) mods |= 0x4u;
+                        g_capturedMods.store(mods, std::memory_order_release);
+                        g_capturedVk.store(vk, std::memory_order_release);
+                        g_captureMode.store(0, std::memory_order_relaxed);
+                    }
+                    return 0;
+                }
+
+                InputPushKeyVk(vk, down);
+                return 0;
+            }
+            case WM_CHAR:
+                return 0;   // 菜单自己处理文本输入，别让字符消息漏给游戏
+            default:
+                break;
+        }
+    }
+
     return CallWindowProc(g_origProc ? g_origProc : DefWindowProcW, h, msg, w, l);
 }
 

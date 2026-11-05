@@ -61,4 +61,14 @@ bool InputPassthroughActive();   // test-only probe: is the borrow window open?
 // races the injected strokes).
 void InputPushEvent(const InputEvent& e);
 
+// ---- 方案 C：窗口消息输入通道 ---------------------------------------------
+// 引擎模式下不装任何全局钩子，菜单输入改由窗口消息提供：
+//   * 键盘：游戏窗口仍是前台窗口，键消息进它的 WndProc（已子类化）→ 这里
+//   * 鼠标：覆盖窗是 topmost 的真实窗口，指针下的消息进它的 WndProc → 这里
+// 这些包装只做 VK/坐标转换，然后走同一条事件队列，ImGui 侧无需改动。
+void InputPushKeyVk(unsigned vk, bool down);      // VK -> ImGuiKey；映射不到则丢弃
+void InputPushMouseButton(int button, bool down); // 0=左 1=右 2=中 3/4=侧键
+void InputPushWheel(float dy);                    // ImGui 滚轮单位
+void InputPushMoveScreen(int screenX, int screenY);
+
 } // namespace pbzfm

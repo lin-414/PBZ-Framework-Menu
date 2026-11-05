@@ -125,6 +125,47 @@ Overlay g_ov;
 
 LRESULT CALLBACK OverlayWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     if (msg == WM_ERASEBKGND) return 1;
+
+    // ---- 方案 C：引擎模式的鼠标通道 ----------------------------------------
+    // 没有全局鼠标钩子时，指针落在覆盖窗上，消息自然进这里；钩子路径不走到这里
+    // （EnginePortActive() 为假），行为与旧版完全一致。
+    if (EnginePortActive()) {
+        switch (msg) {
+            case WM_MOUSEMOVE: {
+                POINT p{ (LONG)(short)LOWORD(l), (LONG)(short)HIWORD(l) };
+                ClientToScreen(h, &p);
+                InputPushMoveScreen(p.x, p.y);
+                return 0;
+            }
+            case WM_LBUTTONDOWN: case WM_LBUTTONUP:
+                if (msg == WM_LBUTTONDOWN) SetCapture(h); else ReleaseCapture();
+                InputPushMouseButton(0, msg == WM_LBUTTONDOWN);
+                return 0;
+            case WM_RBUTTONDOWN: case WM_RBUTTONUP:
+                InputPushMouseButton(1, msg == WM_RBUTTONDOWN);
+                return 0;
+            case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+                InputPushMouseButton(2, msg == WM_MBUTTONDOWN);
+                return 0;
+            case WM_XBUTTONDOWN: case WM_XBUTTONUP: {
+                const unsigned xb = HIWORD(w);
+                if (xb == XBUTTON1 || xb == XBUTTON2)
+                    InputPushMouseButton(2 + (int)xb, msg == WM_XBUTTONDOWN);
+                return 0;
+            }
+            case WM_MOUSEWHEEL:
+                InputPushWheel((float)GET_WHEEL_DELTA_WPARAM(w) / (float)WHEEL_DELTA);
+                return 0;
+            case WM_MOUSEHWHEEL:
+                return 0;
+            case WM_SETCURSOR:
+                // 系统光标是可见的（引擎侧 bShowMouseCursor），这里只保证它是箭头。
+                SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+                return TRUE;
+            default:
+                break;
+        }
+    }
     return DefWindowProcW(h, msg, w, l);
 }
 
@@ -978,6 +1019,10 @@ void SetVisible(bool v) {
             EnginePortSetMenuOpen(true);
             g_ov.cursorHiddenByUs = false;
             ImGui::GetIO().MouseDrawCursor = false;   // 系统光标由引擎显示，不画第二个
+            // 没有钩子就没有"第一次移动"事件：先按当前光标位置播种一次，
+            // 否则 ImGui 的 MousePos 会停在 -FLT_MAX，菜单要等鼠标动一下才能点。
+            POINT seed{};
+            if (GetCursorPos(&seed)) InputPushMoveScreen(seed.x, seed.y);
         } else {
             // The input hook freezes the real cursor and ImGui draws its own
             // (MouseDrawCursor), so the real one is hidden while the menu is open.

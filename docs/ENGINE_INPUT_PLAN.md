@@ -14,8 +14,23 @@
 | 光标 | **引擎后端**（`bShowMouseCursor`） | ImGui 不再自绘光标，避免双光标 |
 | 全局热键 / 录屏 | **不再被碰** | 模块不再安装任何 `WH_KEYBOARD_LL` / `WH_MOUSE_LL`，不再改 Raw Input |
 
-也就是说：方案 C 负责「冻结」，方案 A 的窗口消息通道负责「取输入」。两者合起来
+也就是说：方案 C 负责「冻结」，窗口消息通道负责「取输入」。两者合起来
 才是完整的零 OS 侵入方案。
+
+输入通道的实现（全部无全局钩子）：
+
+| 事件 | 来源 | 位置 |
+| --- | --- | --- |
+| 键盘（菜单开着时） | 游戏窗口 `WM_KEYDOWN/UP`、`WM_SYSKEY*`（已子类化），吞掉并喂 ImGui | `game_window.cpp` `GameWndProc` |
+| 呼出键 / Esc | 同一个 WndProc 里识别 `toggle_key`；菜单关着时只认它，其余原样 `CallWindowProc` | 同上 |
+| 键位捕获 | 同上，`g_captureMode` 优先于喂菜单（用 `GetAsyncKeyState` 取修饰位） | 同上 |
+| 鼠标移动 / 按键 / 滚轮 | 覆盖窗自己的 `WM_MOUSEMOVE`/`WM_*BUTTON*`/`WM_MOUSEWHEEL`（topmost，指针下就是它） | `overlay.cpp` `OverlayWndProc` |
+| 光标显示 | 引擎 `bShowMouseCursor`；ImGui 不自绘（`MouseDrawCursor=false`），避免双光标 | `engine_port_ue4ss.cpp` |
+| 开菜单时的鼠标播种 | `GetCursorPos()` 推一次 Move，避免 ImGui 的 MousePos 停在 `-FLT_MAX` | `overlay.cpp` `SetVisible(true)` |
+
+已知边界：引擎模式下呼出键依赖游戏窗口是前台窗口（覆盖窗是 `WS_EX_NOACTIVATE`，
+所以菜单打开时游戏仍是前台，这一点成立）。如果将来要做「从桌面呼出」，再补一个
+只认呼出键的全局钩子即可，不影响本方案。
 
 ## 2. 结构
 
@@ -109,6 +124,7 @@ input_mode = auto     ; auto | engine | os
 | `ctest`（两套构建） | ✅ i18n_test + framework_test 全绿 |
 | 新增单测：后端策略 / `input_mode` 读写 | ✅ `C input backend policy`、`C input_mode config` |
 | 引擎后端源码编译（真实 UE4SS 头 + UE4SS.lib） | ✅ 编译+链接通过 |
+| 窗口消息输入通道（键盘走游戏 WndProc、鼠标走覆盖窗、呼出键/键位捕获） | ✅ 两套构建通过 + ctest 全绿；实机行为待验证 |
 
 ## 6. 待实机验证（必须做，不含糊）
 
