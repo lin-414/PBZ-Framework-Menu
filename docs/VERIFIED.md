@@ -27,6 +27,7 @@
 | **实机**：界面拖动移动/调整大小保留（会话内） | ✅ 2026-11-01 |
 | 手柄适配（长按选择键呼出/A 点击/摇杆/XInputEnable 冻结往返）host 回归全绿 | ✅ 2026-11-01（0.3.1 已搁置，未进包） |
 | 截图直通状态机（Ctrl+Alt+F9 开借用窗口→键鼠放行→宽限期+前台回游戏自动恢复隔离；呼出键始终可关菜单）host 回归 | ✅ 2026-11-01 |
+| 截图直通键菜单内编辑（点击组合键重捕获带修饰键、× 删除、添加追加；改完即时生效并写回 ini；host 设置页截图目检） | ✅ 2026-11-02 |
 
 ## 0.4.0 新增（host 回归通过；实机复核待做）
 
@@ -37,7 +38,6 @@
 | 组合键热键 AddHotkeyEx(vk+mods 严格匹配) / RemoveHotkey | ⏳ 待实机（host 未断言） |
 | schema 组合键捕获（SCH_KEYCOMBO，修饰键 + 末键） | ⏳ 待实机（host 未断言） |
 | 分区生命周期 RenameSection / DeleteSection / RemoveSectionItem | ⏳ 待实机（host 未断言） |
-| 侧边栏搜索框（按显示名/原名过滤，选中项不跳变） | ⏳ 待实机（host 未断言） |
 | 主题 JSON（themes\<name>.json 覆盖颜色/圆角/边框；设置页选择器） | ⏳ 待实机（host 未断言） |
 | 纹理 API LoadTexture/Image/DisposeTexture（stb_image，渲染线程上传） | ⏳ 待实机（host 未断言） |
 | 新 Widget：InputText/CollapsingHeader/Selectable/ProgressBar/ColorEdit3 | ⏳ 待实机（host 未断言） |
@@ -49,6 +49,11 @@
 | --- | --- |
 | 侧边栏分类树（单页模组单行、展开箭头、**默认全部收起**、点击即切换展开/收起、选中金色 + 朱砂条） | ⏳ 待实机（host 截图覆盖） |
 | 嵌套路径 API：SetSectionPath / ConfigCreatePath / AddSectionItemPath（'/' 分隔、'\\' 转义、中间节点自动创建） | ✅ demo_mod "演示模组/高级参数" 经 host 回归 |
-| 树形搜索过滤（子树匹配、过滤期间全展开） | ⏳ 待实机（host 未断言） |
 | 展开状态仅会话内、默认收起（不写 PBZFM.ini，按用户选择） | ✅ 设计确认 |
 | v1 兼容：单段名 Rename/Delete/Remove 与旧调用不变；GetSectionCount/Rect 仍按根行枚举 | ✅ host 回归全绿 |
+
+## 0.5.1 新增（host 已验证；实机复核待做）
+
+| 项 | 结果 |
+| --- | --- |
+| 面板缩放联动：拖拽调整面板大小时字体、侧栏与按钮宽度按面板宽度等比缩放（字体整体封顶 0.7–1.8 倍），并受窗口最小/最大尺寸限制 | ✅ 2026-11-02 host 截图对比（默认/放大/最小三态） |

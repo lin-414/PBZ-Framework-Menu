@@ -6,6 +6,9 @@
   "shot_saved": "Saved to the Screenshots folder",
   "passthrough": "Screenshot-tool passthrough",
   "passthrough_hint": "While the menu is open, the first press of these chords opens an input borrow (no visual change is normal) and the SECOND press reaches PixPin/NVIDIA for real (the camera stays frozen); isolation resumes when you return to the game. Configure passthrough_keys in PBZFM.ini [framework], comma-separated, e.g. Ctrl+P, Alt+F1",
+  "passthrough_add": "Add chord",
+  "passthrough_edit_tip": "Click, then press a new chord (Ctrl/Shift/Alt; Win is not supported)",
+  "passthrough_del_tip": "Remove",
   "hint": "Independent DirectComposition overlay",
   "btn_test": "Test button",
   "count": "clicks",
@@ -27,8 +30,6 @@
   "save": "Save settings",
   "close_menu": "Close menu (Esc)",
   "saved": "Saved to PBZFM.ini",
-  "search": "Search",
-  "search_hint": "Type to filter mods...",
   "theme": "Theme",
   "theme_builtin": "Ink & Gold",
   "select_hint": "Pick a category on the left"

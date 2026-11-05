@@ -11,6 +11,8 @@ struct MenuUi {
     bool  capturing = false;  // mirrored from g_captureMode for display
     bool  requestSave = false; // set by the save button / language switch
     bool  requestScreenshot = false; // set by the screenshot button
+    float panelW = 0.0f;      // last frame's panel width, drives the resize zoom
+    float zoom = 1.0f;        // panel zoom: font size + fixed-width chrome scale
 };
 
 void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt);

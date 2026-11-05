@@ -89,7 +89,7 @@
 #define PBZFM_MOD_CTRL  0x1u
 #define PBZFM_MOD_SHIFT 0x2u
 #define PBZFM_MOD_ALT   0x4u
-#define PBZFM_MOD_WIN   0x8u
+#define PBZFM_MOD_WIN   0x8u  /* never fires: the input hook must pass Win to the shell */
 
 /* When building the framework itself the declarations export; client mods
  * include this header with PBZFM_EXPORTS undefined and get plain
@@ -114,7 +114,12 @@ typedef void* PBZFM_Config; /* opaque handle from PBZFM_ConfigCreate */
 
 /* ---- framework discovery ------------------------------------------------ */
 
-PBZFM_API int  PBZFM_GetAbiVersion(void);  /* running framework's API version */
+/* Historical name: returns the running framework's API version (PBZFM_API_VERSION),
+ * NOT the minimum ABI this header requires. The name is kept for ABI stability;
+ * PBZFM_GetApiVersion below is the same value under an accurate name. */
+PBZFM_API int  PBZFM_GetAbiVersion(void);
+/* v3 alias of PBZFM_GetAbiVersion; NULL on older frameworks (optional). */
+PBZFM_API int  PBZFM_GetApiVersion(void);
 PBZFM_API int  PBZFM_IsMenuOpen(void);     /* 1 while the overlay menu is visible */
 
 /* ---- sections & pages --------------------------------------------------- */
@@ -180,7 +185,10 @@ PBZFM_API void     PBZFM_SetInt(PBZFM_Config cfg, const char* key, int v);
 PBZFM_API void     PBZFM_SetEnum(PBZFM_Config cfg, const char* key, int idx);
 PBZFM_API void     PBZFM_SetKey(PBZFM_Config cfg, const char* key, unsigned vk);
 PBZFM_API void     PBZFM_SetKeyCombo(PBZFM_Config cfg, const char* key, unsigned vk, unsigned mods);
-/* v2 human-readable name: "F9", "Ctrl+Alt+P"; writes into buf, returns length. */
+/* v2 human-readable name: "F9", "Ctrl+Alt+P"; writes into buf, returns length.
+ * L6: a too-small buffer truncates the name (bufLen-1 bytes + NUL) and returns
+ * the written length - no error state, no format change; the framework logs a
+ * throttled warning instead. Use the return value to detect truncation. */
 PBZFM_API int      PBZFM_KeyName(unsigned vk, unsigned mods, char* buf, int bufLen);
 
 /* ---- gameplay hotkeys ---------------------------------------------------- */
@@ -230,10 +238,12 @@ PBZFM_API void  PBZFM_DisposeTexture(void* texture);
 PBZFM_API void  PBZFM_Image(void* texture, float w, float h);
 
 /* ---- advanced: raw ImGui escape hatch ----------------------------------- */
-/* Returns the framework's ImGuiContext*. If your mod statically links the
- * SAME ImGui version the framework was built with, you may call
- * ImGui::SetCurrentContext(PBZFM_GetImGuiContext()) inside your render
- * callback and use ImGui directly. Version mismatches corrupt memory. */
+/* Returns the framework's ImGuiContext*. Version-coupled escape hatch: if your
+ * mod statically links the SAME ImGui version the framework was built with
+ * (currently 1.92.1), you may call ImGui::SetCurrentContext() inside your
+ * render callback and use ImGui directly. The framework may upgrade its vendored
+ * ImGui between releases, so bind this to a specific framework build only;
+ * any version mismatch corrupts memory. */
 PBZFM_API void* PBZFM_GetImGuiContext(void);
 
 /* ---- automation helpers (test tooling; overlay-client pixels) ------------ */
@@ -326,6 +336,8 @@ struct PBZFM_Api {
     void     (*SetSectionPath)(const char* path_utf8);
     void     (*AddSectionItemPath)(const char* path_utf8, PBZFM_RenderFn, void*);
     PBZFM_Config (*ConfigCreatePath)(const char* store_utf8, const char* path_utf8);
+    /* ---- v3 alias (optional; NULL when the framework predates it) ---- */
+    int      (*GetApiVersion)(void);   /* same value as GetAbiVersion, accurate name */
 };
 
 #ifdef __cplusplus
@@ -337,9 +349,13 @@ extern "C" {
  * must be >= PBZFM_ABI_VERSION; v2+ functions resolve optionally and may be
  * NULL (null-check before use). */
 static int PBZFM_LoadApi(struct PBZFM_Api* out) {
-    HMODULE m = GetModuleHandleW(L"PBZFM.dll");
-    if (!m || !out) return 0;
+    // M7: zero `out` before any early return so a failed load (framework not
+    // present yet) leaves deterministic NULL pointers instead of stack garbage
+    // that a caller might mistake for a resolved API.
+    if (!out) return 0;
     memset(out, 0, sizeof(*out));
+    HMODULE m = GetModuleHandleW(L"PBZFM.dll");
+    if (!m) return 0;
 #define PBZFM_GET(field, name) do { *(FARPROC*)&out->field = GetProcAddress(m, name); if (!out->field) return 0; } while (0)
 #define PBZFM_GET_OPT(field, name) do { *(FARPROC*)&out->field = GetProcAddress(m, name); } while (0)
     PBZFM_GET(GetAbiVersion, "PBZFM_GetAbiVersion");
@@ -402,6 +418,7 @@ static int PBZFM_LoadApi(struct PBZFM_Api* out) {
     PBZFM_GET_OPT(SetSectionPath, "PBZFM_SetSectionPath");
     PBZFM_GET_OPT(AddSectionItemPath, "PBZFM_AddSectionItemPath");
     PBZFM_GET_OPT(ConfigCreatePath, "PBZFM_ConfigCreatePath");
+    PBZFM_GET_OPT(GetApiVersion, "PBZFM_GetApiVersion");
 #undef PBZFM_GET_OPT
 #undef PBZFM_GET
     if (out->GetAbiVersion() < PBZFM_ABI_VERSION) return 0;

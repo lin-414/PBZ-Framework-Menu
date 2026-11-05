@@ -12,13 +12,32 @@
 
 #include <imgui.h>
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 using namespace pbzfm;
 
+namespace {
+// B1: the store was loaded when the config was created, before any control
+// existed. Apply the disk value for this key at declaration time, then store
+// the item - otherwise every ConfigAdd* default overwrote the player's value.
+void AddSchemaItem(ConfigDef* c, SchemaItem&& it) {
+    c->ApplyStored(it);
+    c->items.push_back(std::move(it));
+}
+} // namespace
+
 extern "C" {
 
+// M7: the export name is historic ("AbiVersion") and must never change (ABI
+// rule); it has always reported PBZFM_API_VERSION, i.e. the framework's API
+// version, not the minimum ABI the header requires. PBZFM_GetApiVersion below
+// is the honestly-named alias; keep both so old and new clients work.
 __declspec(dllexport) int PBZFM_GetAbiVersion(void) {
+    return PBZFM_API_VERSION;
+}
+
+__declspec(dllexport) int PBZFM_GetApiVersion(void) {
     return PBZFM_API_VERSION;
 }
 
@@ -69,52 +88,66 @@ __declspec(dllexport) void PBZFM_SetSectionPath(const char* path_utf8) {
 
 __declspec(dllexport) void PBZFM_AddSectionItemPath(const char* path_utf8, PBZFM_RenderFn fn, void* userdata) {
     if (!path_utf8 || !fn) return;
-    Section* s = RegistryGetOrCreatePath(path_utf8);
-    if (!s) return;
-    Page p;
-    p.label = s->name;   // the last path segment names the content row
-    p.fn = fn;
-    p.ud = userdata;
-    RegistryAddPage(s, p);
+    // Review H8: lookup, label read and page attach happen inside one registry
+    // transaction - a concurrent DeleteSection can no longer free the node
+    // between the old two-call sequence.
+    RegistryWithPath(path_utf8, [&](Section* s) {
+        Page p;
+        p.label = s->name;   // the last path segment names the content row
+        p.fn = fn;
+        p.ud = userdata;
+        RegistryAddPage(s, p);
+    });
 }
 
 __declspec(dllexport) PBZFM_Config PBZFM_ConfigCreatePath(const char* store_utf8, const char* path_utf8) {
     if (!path_utf8) return nullptr;
-    Section* s = RegistryGetOrCreatePath(path_utf8);
-    if (!s) return nullptr;
-    return (PBZFM_Config)SchemaCreateConfigAt(s, store_utf8, s->name.c_str());
+    ConfigDef* created = nullptr;
+    // Review H8: same transaction; the node stays alive for the whole
+    // SchemaCreateConfigAt call (page attach + store load included).
+    RegistryWithPath(path_utf8, [&](Section* s) {
+        created = SchemaCreateConfigAt(s, store_utf8, s->name.c_str());
+    });
+    return (PBZFM_Config)created;
 }
 
 // ---- schema ----
 
 __declspec(dllexport) PBZFM_Config PBZFM_ConfigCreate(const char* store_utf8, const char* page_label_utf8) {
+    // Review H8: the whole create (current-section resolve + page attach + store
+    // load) runs under the registry lock, so the page cannot become visible
+    // half-initialized to the render thread.
+    std::lock_guard<std::recursive_mutex> lock(RegistryMutex());
     return (PBZFM_Config)SchemaCreateConfig(store_utf8, page_label_utf8);
 }
 
 __declspec(dllexport) void PBZFM_ConfigAddGroup(PBZFM_Config cfg, const char* label_utf8) {
     ConfigDef* c = SchemaValidate(cfg);
     if (!c || !label_utf8) return;
+    std::lock_guard<std::recursive_mutex> lock(RegistryMutex());   // H3: same lock the render frame holds
     SchemaItem it;
     it.type = SCH_GROUP;
     it.label = label_utf8;
-    c->items.push_back(std::move(it));
+    AddSchemaItem(c, std::move(it));
 }
 
 __declspec(dllexport) void PBZFM_ConfigAddBool(PBZFM_Config cfg, const char* key, const char* label_utf8, int def) {
     ConfigDef* c = SchemaValidate(cfg);
     if (!c || !key || !label_utf8) return;
+    std::lock_guard<std::recursive_mutex> lock(RegistryMutex());   // H3: same lock the render frame holds
     SchemaItem it;
     it.type = SCH_BOOL;
     it.key = key;
     it.label = label_utf8;
     it.ival = def ? 1 : 0;
-    c->items.push_back(std::move(it));
+    AddSchemaItem(c, std::move(it));
 }
 
 __declspec(dllexport) void PBZFM_ConfigAddInt(PBZFM_Config cfg, const char* key, const char* label_utf8,
                                               int def, int mn, int mx) {
     ConfigDef* c = SchemaValidate(cfg);
     if (!c || !key || !label_utf8 || mx < mn) return;
+    std::lock_guard<std::recursive_mutex> lock(RegistryMutex());   // H3: same lock the render frame holds
     SchemaItem it;
     it.type = SCH_INT;
     it.key = key;
@@ -123,13 +156,14 @@ __declspec(dllexport) void PBZFM_ConfigAddInt(PBZFM_Config cfg, const char* key,
     it.mn = (float)mn;
     it.mx = (float)mx;
     it.step = 1.f;
-    c->items.push_back(std::move(it));
+    AddSchemaItem(c, std::move(it));
 }
 
 __declspec(dllexport) void PBZFM_ConfigAddFloat(PBZFM_Config cfg, const char* key, const char* label_utf8,
                                                 float def, float mn, float mx, float step, const char* fmt_utf8) {
     ConfigDef* c = SchemaValidate(cfg);
     if (!c || !key || !label_utf8 || mx < mn) return;
+    std::lock_guard<std::recursive_mutex> lock(RegistryMutex());   // H3: same lock the render frame holds
     SchemaItem it;
     it.type = SCH_FLOAT;
     it.key = key;
@@ -139,13 +173,14 @@ __declspec(dllexport) void PBZFM_ConfigAddFloat(PBZFM_Config cfg, const char* ke
     it.mx = mx;
     it.step = step > 0.f ? step : 1.f;
     it.fmt = fmt_utf8 ? fmt_utf8 : "%.3f";
-    c->items.push_back(std::move(it));
+    AddSchemaItem(c, std::move(it));
 }
 
 __declspec(dllexport) void PBZFM_ConfigAddEnum(PBZFM_Config cfg, const char* key, const char* label_utf8,
                                                int def, const char* const* options_utf8, int count) {
     ConfigDef* c = SchemaValidate(cfg);
     if (!c || !key || !label_utf8 || !options_utf8 || count <= 0) return;
+    std::lock_guard<std::recursive_mutex> lock(RegistryMutex());   // H3: same lock the render frame holds
     SchemaItem it;
     it.type = SCH_ENUM;
     it.key = key;
@@ -157,42 +192,51 @@ __declspec(dllexport) void PBZFM_ConfigAddEnum(PBZFM_Config cfg, const char* key
     }
     if (it.options.empty()) return;
     it.ival = std::clamp((long long)def, 0LL, (long long)it.options.size() - 1);
-    c->items.push_back(std::move(it));
+    AddSchemaItem(c, std::move(it));
 }
 
 __declspec(dllexport) void PBZFM_ConfigAddKey(PBZFM_Config cfg, const char* key, const char* label_utf8, unsigned defVk) {
     ConfigDef* c = SchemaValidate(cfg);
     if (!c || !key || !label_utf8) return;
+    std::lock_guard<std::recursive_mutex> lock(RegistryMutex());   // H3: same lock the render frame holds
     SchemaItem it;
     it.type = SCH_KEY;
     it.key = key;
     it.label = label_utf8;
     it.ival = defVk & 0xFFu;
-    c->items.push_back(std::move(it));
+    AddSchemaItem(c, std::move(it));
 }
 
 __declspec(dllexport) void PBZFM_ConfigAddKeyCombo(PBZFM_Config cfg, const char* key, const char* label_utf8,
                                                    unsigned defVk, unsigned defMods) {
     ConfigDef* c = SchemaValidate(cfg);
     if (!c || !key || !label_utf8) return;
+    std::lock_guard<std::recursive_mutex> lock(RegistryMutex());   // H3: same lock the render frame holds
     SchemaItem it;
     it.type = SCH_KEYCOMBO;
     it.key = key;
     it.label = label_utf8;
     it.ival = (long long)((defVk & 0xFFu) | ((defMods & 0xFu) << 8));
-    c->items.push_back(std::move(it));
+    AddSchemaItem(c, std::move(it));
 }
 
 __declspec(dllexport) void PBZFM_ConfigOnChange(PBZFM_Config cfg, PBZFM_ChangeFn fn, void* userdata) {
     ConfigDef* c = SchemaValidate(cfg);
     if (!c) return;
+    // H3: changeFn is read by the render thread's form and by the setters below,
+    // so its write takes the same registry lock the frame holds. H5: register the
+    // config so the orphan sweep can clear a callback whose mod DLL unloaded.
+    std::lock_guard<std::recursive_mutex> lock(RegistryMutex());
     c->changeFn = fn;
     c->changeUd = userdata;
+    if (fn) RegistryTrackConfigCallback(c);
 }
 
 __declspec(dllexport) void PBZFM_ConfigSave(PBZFM_Config cfg) {
     ConfigDef* c = SchemaValidate(cfg);
     if (!c) return;
+    // H3: SchemaSaveConfigNow takes the registry lock before walking items,
+    // so a mod thread can never mutate the list mid-write.
     SchemaSaveConfigNow(c);
 }
 
@@ -200,6 +244,7 @@ __declspec(dllexport) void PBZFM_ConfigSave(PBZFM_Config cfg) {
     __declspec(dllexport) type PBZFM_##name(PBZFM_Config cfg, const char* key) {     \
         ConfigDef* c = SchemaValidate(cfg);                                          \
         if (!c) return (type)0;                                                      \
+        std::lock_guard<std::recursive_mutex> lock(RegistryMutex());   /* H3 */      \
         SchemaItem* it = c->Find(key);                                               \
         return it ? (type)it->field : (type)0;                                       \
     }
@@ -212,6 +257,7 @@ PBZFM_GETTER(int, GetEnum, ival)
 __declspec(dllexport) unsigned PBZFM_GetKey(PBZFM_Config cfg, const char* key) {
     ConfigDef* c = SchemaValidate(cfg);
     if (!c || !key) return 0;
+    std::lock_guard<std::recursive_mutex> lock(RegistryMutex());   // H3
     SchemaItem* it = c->Find(key);
     return it ? (unsigned)it->ival & 0xFFu : 0u;   // combos store mods in the high bits
 }
@@ -219,6 +265,7 @@ __declspec(dllexport) unsigned PBZFM_GetKey(PBZFM_Config cfg, const char* key) {
 __declspec(dllexport) unsigned PBZFM_GetKeyMods(PBZFM_Config cfg, const char* key) {
     ConfigDef* c = SchemaValidate(cfg);
     if (!c || !key) return 0;
+    std::lock_guard<std::recursive_mutex> lock(RegistryMutex());   // H3
     SchemaItem* it = c->Find(key);
     return it ? ((unsigned)it->ival >> 8) & 0xFu : 0u;
 }
@@ -227,6 +274,7 @@ __declspec(dllexport) unsigned PBZFM_GetKeyMods(PBZFM_Config cfg, const char* ke
     __declspec(dllexport) void PBZFM_##name(PBZFM_Config cfg, const char* key, type v) { \
         ConfigDef* c = SchemaValidate(cfg);                                          \
         if (!c || !key) return;                                                      \
+        std::lock_guard<std::recursive_mutex> lock(RegistryMutex());   /* H3 */      \
         SchemaItem* it = c->Find(key);                                               \
         if (!it) return;                                                             \
         if (isFloat) it->fval = v; else it->ival = (long long)v;                     \
@@ -236,6 +284,7 @@ __declspec(dllexport) unsigned PBZFM_GetKeyMods(PBZFM_Config cfg, const char* ke
 __declspec(dllexport) void PBZFM_SetBool(PBZFM_Config cfg, const char* key, int v) {
     ConfigDef* c = SchemaValidate(cfg);
     if (!c || !key) { Log("[api] SetBool: invalid config"); return; }
+    std::lock_guard<std::recursive_mutex> lock(RegistryMutex());   // H3
     SchemaItem* it = c->Find(key);
     if (!it) { Log("[api] SetBool: key not found: %s", key); return; }
     it->ival = (long long)v;
@@ -252,6 +301,7 @@ PBZFM_SETTER(SetKey, unsigned, ival, false)
 __declspec(dllexport) void PBZFM_SetKeyCombo(PBZFM_Config cfg, const char* key, unsigned vk, unsigned mods) {
     ConfigDef* c = SchemaValidate(cfg);
     if (!c || !key) return;
+    std::lock_guard<std::recursive_mutex> lock(RegistryMutex());   // H3
     SchemaItem* it = c->Find(key);
     if (!it || it->type != SCH_KEYCOMBO) return;
     it->ival = (long long)((vk & 0xFFu) | ((mods & 0xFu) << 8));
@@ -263,7 +313,19 @@ __declspec(dllexport) int PBZFM_KeyName(unsigned vk, unsigned mods, char* buf, i
     if (!buf || bufLen <= 0) return 0;
     std::string name = Config::KeyModsToString(vk, mods);
     int len = (int)name.size();
-    if (len >= bufLen) len = bufLen - 1;
+    if (len >= bufLen) {
+        // L6: keep the truncating behaviour already promised to compiled mods
+        // (signature and return value unchanged) but say so, throttled, so the
+        // caller can notice a too-small buffer instead of silently showing a
+        // chopped name.
+        static std::atomic<DWORD> lastWarn{ 0 };
+        DWORD now = GetTickCount();
+        DWORD seen = lastWarn.load(std::memory_order_relaxed);
+        if (now - seen >= 5000 && lastWarn.compare_exchange_strong(seen, now))
+            Log("[api] WARNING: PBZFM_KeyName buffer too small (%d < %d) - name truncated",
+                bufLen, len + 1);
+        len = bufLen - 1;
+    }
     memcpy(buf, name.data(), (size_t)len);
     buf[len] = 0;
     return len;

@@ -2,6 +2,7 @@
 // Schema-backed settings: mods declare typed items, the framework renders a
 // form for them, persists values per store (data/<store>.json) and fires the
 // mod's change callback on every committed edit.
+#include <map>
 #include <string>
 #include <vector>
 
@@ -28,14 +29,25 @@ struct SchemaItem {
 struct ConfigDef {
     unsigned magic = 0x50424643;  // "PBFC"
     std::string store;
+    // H3: `items` (and `dirty` / `changeFn`) are guarded by RegistryMutex():
+    // api.cpp's ConfigAdd*/Get*/Set*, schema.cpp's Load/Save and the menu's
+    // per-frame render all take it. Never touch these fields without it.
     std::vector<SchemaItem> items;
     PBZFM_ChangeFn changeFn = nullptr;
     void* changeUd = nullptr;
     bool dirty = false;
+    // B1: raw disk values (key -> token), kept by Load() so ConfigAdd*() can
+    // apply them once the control is declared. Load() runs at config creation,
+    // when items is still empty, so applying there alone never reached a value.
+    std::map<std::string, std::string> stored;
 
     SchemaItem* Find(const char* key);
+    void ApplyStored(SchemaItem& it) const;   // B1: per-item disk value, clamped by type
     bool Load(const std::wstring& path);
     bool Save(const std::wstring& path);
+    // H5: changeFn may be nulled by RegistryPurgeOrphanedCallbacks() when the
+    // owning mod DLL hot-unloaded; the null check is what makes that safe. All
+    // callers already hold RegistryMutex(), so the read cannot race the purge.
     void FireChange(const char* key) {
         if (changeFn) changeFn(key, changeUd);
     }
@@ -56,10 +68,14 @@ void SchemaSaveAllDirty();                          // called on menu close
 //   (IsItemDeactivatedAfterEdit). File writes happen on ConfigSave / menu close.
 void RenderSchemaForm(ConfigDef& cfg, const I18n& i18n, float dt);
 bool SchemaGetLastItemRect(float out_xyxy[4]);   // overlay-client px, false until a form rendered
+// L4: invalidate the automation rect when the shown page changes, so a stale
+// rect from the previous page is never reported as the current page's item.
+void SchemaClearLastItemRect();
 
 // Key capture targets (render thread only; the capture mode flags are the
 // atomics in common.h).
-enum CaptureKind { CAP_NONE = 0, CAP_TOGGLE = 1, CAP_SCHEMA_KEY = 2, CAP_SCHEMA_KEYCOMBO = 3 };
+enum CaptureKind { CAP_NONE = 0, CAP_TOGGLE = 1, CAP_SCHEMA_KEY = 2, CAP_SCHEMA_KEYCOMBO = 3,
+                  CAP_PASSTHROUGH = 4 };   // settings-page screenshot-tool chord editor
 extern void* g_capCfg;         // ConfigDef* for CAP_SCHEMA_KEY
 extern void* g_capItem;        // SchemaItem* target of the active capture
 

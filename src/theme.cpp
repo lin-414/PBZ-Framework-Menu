@@ -247,9 +247,17 @@ void ApplyThemeByName(const std::string& nameUtf8) {
     Log("[theme] applied %d overrides from %ls", applied, path.c_str());
 }
 
-std::vector<std::string> ListThemeNames() {
-    std::vector<std::string> names;
-    names.push_back("ink");
+namespace {
+std::vector<std::string> s_themeNames;
+bool s_themeNamesLoaded = false;
+} // namespace
+
+void RefreshThemeNames() {
+    // M4: FindFirstFileW on every menu frame was wasted disk I/O; the scan now
+    // runs only when the picker opens (or a theme changes) yet still sees files
+    // added to themes\ in the meantime.
+    s_themeNames.clear();
+    s_themeNames.push_back("ink");
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW((ModRoot() + L"\\themes\\*.json").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
@@ -260,12 +268,17 @@ std::vector<std::string> ListThemeNames() {
             int need = WideCharToMultiByte(CP_UTF8, 0, stem.c_str(), (int)stem.size(), nullptr, 0, nullptr, nullptr);
             std::string u(need, 0);
             WideCharToMultiByte(CP_UTF8, 0, stem.c_str(), (int)stem.size(), u.data(), need, nullptr, nullptr);
-            if (u != "ink") names.push_back(u);
+            if (u != "ink") s_themeNames.push_back(u);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
-    std::sort(names.begin() + 1, names.end());
-    return names;
+    std::sort(s_themeNames.begin() + 1, s_themeNames.end());
+    s_themeNamesLoaded = true;
+}
+
+const std::vector<std::string>& ListThemeNames() {
+    if (!s_themeNamesLoaded) RefreshThemeNames();
+    return s_themeNames;
 }
 
 void PushCapturingStyle() {

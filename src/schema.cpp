@@ -21,6 +21,20 @@ std::vector<std::unique_ptr<ConfigDef>> g_configs;
 
 std::wstring Utf8ToWide(const std::string& u);
 
+// ImGui 1.92's FontScaleMain (driven by the menu's panel zoom and the UI-scale
+// slider) scales glyphs but not explicit ImVec2 sizes. Key-cap buttons used to
+// hardcode 150px, so long names (MOUSE_LEFT / CAPSLOCK / chords) were clipped
+// when the interface was enlarged. Derive the width from the current font:
+// keep the old 150px footprint as the scaled minimum and reserve enough room
+// for the label plus frame padding.
+float KeyButtonWidth(const char* label) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float fontScale = style.FontSizeBase > 0.0f ? ImGui::GetFontSize() / style.FontSizeBase : 1.0f;
+    const float minWidth = 150.0f * fontScale;
+    const float textWidth = ImGui::CalcTextSize(label).x + style.FramePadding.x * 2.0f + 2.0f;
+    return textWidth > minWidth ? textWidth : minWidth;
+}
+
 std::wstring DataDir() { return RootFile(L"data"); }
 std::wstring StorePath(const std::string& store) {
     return DataDir() + L"\\" + Utf8ToWide(store) + L".json";
@@ -53,12 +67,37 @@ std::string ReadFileText(const std::wstring& path) {
     return out;
 }
 
-bool WriteFileText(const std::wstring& path, const std::string& utf8) {
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return false;
-    bool ok = fwrite(utf8.data(), 1, utf8.size(), f) == utf8.size();
-    fclose(f);
-    return ok;
+// M1: stores go through WriteFileAtomic (common.h) so a torn write can never
+// leave a half-written json behind; the local FILE*-based writer is gone.
+
+// M2: keys were emitted verbatim, so a key containing a quote, backslash or
+// control character made the whole store unparsable on the next load. Escape
+// the minimal JSON set; ParseFlatJsonRaw already decodes these escapes, and
+// ordinary keys keep their exact previous bytes (old stores stay compatible).
+std::string JsonEscapeKey(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char esc[8];
+                    snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)c);
+                    out += esc;
+                } else {
+                    out += (char)c;
+                }
+                break;
+        }
+    }
+    return out;
 }
 
 } // namespace
@@ -71,6 +110,60 @@ SchemaItem* ConfigDef::Find(const char* key) {
     return nullptr;
 }
 
+void ConfigDef::ApplyStored(SchemaItem& it) const {
+    // B1: two-phase persistence. At creation (SchemaCreateConfigAt) Load() ran
+    // against an empty items list; ConfigAdd*() calls this as each control
+    // appears so the value already on disk wins over the declared default.
+    // A missing key or a non-numeric token keeps the default (old behavior).
+    if (it.type == SCH_GROUP || it.key.empty()) return;
+    auto found = stored.find(it.key);
+    if (found == stored.end()) return;
+    const std::string& v = found->second;
+    char* end = nullptr;
+    switch (it.type) {
+        case SCH_BOOL:
+            it.ival = (v == "true" || v == "1") ? 1 : 0;
+            break;
+        case SCH_INT:
+        case SCH_ENUM:
+        case SCH_KEY:
+        case SCH_KEYCOMBO:   // packed vk | (mods << 8)
+            it.ival = strtoll(v.c_str(), &end, 10);
+            if (end == v.c_str()) return;   // non-numeric disk token: keep the default
+            // M6: an old store may hold the Win modifier, which can never fire
+            // (the hook must let Win reach the shell). Drop that bit so the item
+            // shows and matches the working part of the chord instead of a dead
+            // "Win+" label; the next save persists the normalized value.
+            if (it.ival & 0x800) {
+                Log("[schema] %s: Win modifier in '%s' is unsupported, dropped",
+                    store.c_str(), it.key.c_str());
+                it.ival &= ~0x800;
+            }
+            break;
+        case SCH_FLOAT:
+            it.fval = (float)strtod(v.c_str(), &end);
+            if (end == v.c_str()) return;
+            break;
+        default:
+            return;
+    }
+    // Same clamping Load() applied after coercion; reused here so an item
+    // declared late cannot end up outside its slider/combo range.
+    switch (it.type) {
+        case SCH_INT:
+            it.ival = std::clamp<long long>(it.ival, (long long)it.mn, (long long)it.mx);
+            break;
+        case SCH_ENUM:
+            it.ival = it.options.empty() ? 0 : std::clamp<long long>(it.ival, 0, (long long)it.options.size() - 1);
+            break;
+        case SCH_FLOAT:
+            it.fval = std::clamp(it.fval, it.mn, it.mx);
+            break;
+        default:
+            break;
+    }
+}
+
 bool ConfigDef::Load(const std::wstring& path) {
     std::string text = ReadFileText(path);
     if (text.empty()) return false;
@@ -79,43 +172,12 @@ bool ConfigDef::Load(const std::wstring& path) {
         Log("[schema] store %s: unparsable json, ignored", store.c_str());
         return false;
     }
-    for (auto& it : items) {
-        auto found = raw.find(it.key);
-        if (found == raw.end()) continue;
-        const std::string& v = found->second;
-        switch (it.type) {
-            case SCH_BOOL:
-                it.ival = (v == "true" || v == "1") ? 1 : 0;
-                break;
-            case SCH_INT:
-            case SCH_ENUM:
-            case SCH_KEY:
-            case SCH_KEYCOMBO:   // packed vk | (mods << 8)
-                it.ival = strtoll(v.c_str(), nullptr, 10);
-                break;
-            case SCH_FLOAT:
-                it.fval = (float)strtod(v.c_str(), nullptr);
-                break;
-            default:
-                break;
-        }
-    }
-    // clamp
-    for (auto& it : items) {
-        switch (it.type) {
-            case SCH_INT:
-                it.ival = std::clamp<long long>(it.ival, (long long)it.mn, (long long)it.mx);
-                break;
-            case SCH_ENUM:
-                it.ival = std::clamp<long long>(it.ival, 0, (long long)it.options.size() - 1);
-                break;
-            case SCH_FLOAT:
-                it.fval = std::clamp(it.fval, it.mn, it.mx);
-                break;
-            default:
-                break;
-        }
-    }
+    // B1: keep the raw key -> token map; items declared later pull their
+    // value from it through ApplyStored(). An explicit reload arrives with
+    // items already present, so apply the map to them as well. Duplicate
+    // keys behave as before (the later item simply reads the same token).
+    stored = std::move(raw);
+    for (auto& it : items) ApplyStored(it);
     dirty = false;
     return true;
 }
@@ -129,33 +191,39 @@ bool ConfigDef::Save(const std::wstring& path) {
         if (it.type == SCH_GROUP) continue;
         if (!first) out += ",\n";
         first = false;
+        // M2: build the key through the escaper; the value text stays numeric.
+        const std::string key = JsonEscapeKey(it.key);
         switch (it.type) {
             case SCH_BOOL:
-                out += "  \"" + it.key + "\": " + std::string(it.ival ? "true" : "false");
+                out += "  \"" + key + "\": " + std::string(it.ival ? "true" : "false");
                 break;
             case SCH_INT:
             case SCH_ENUM:
             case SCH_KEY:
             case SCH_KEYCOMBO:
-                snprintf(buf, sizeof(buf), "  \"%s\": %lld", it.key.c_str(), it.ival);
-                out += buf;
+                out += "  \"" + key + "\": " + std::to_string(it.ival);
                 break;
             case SCH_FLOAT:
-                snprintf(buf, sizeof(buf), "  \"%s\": %.6g", it.key.c_str(), it.fval);
-                out += buf;
+                snprintf(buf, sizeof(buf), "%.6g", it.fval);
+                out += "  \"" + key + "\": " + buf;
                 break;
             default:
                 break;
         }
     }
     out += "\n}\n";
-    bool ok = WriteFileText(path, out);
+    bool ok = WriteFileAtomic(path, out);   // M1: atomic replace, failure already logged
     if (ok) dirty = false;
     return ok;
 }
 
 ConfigDef* SchemaCreateConfigAt(Section* section, const char* store_utf8, const char* page_label_utf8) {
     if (!section) return nullptr;
+    // H8: the Section* is only guaranteed alive while the registry lock is held
+    // (a concurrent DeleteSection frees the node). Callers such as the nested
+    // path API already wrap this in RegistryWithPath; taking the recursive lock
+    // here makes the guarantee local to the function instead of caller folklore.
+    std::lock_guard<std::recursive_mutex> registryLock(RegistryMutex());
     ConfigDef* cfg = new ConfigDef();
     cfg->store = store_utf8 ? store_utf8 : "config";
     Page p;
@@ -166,6 +234,9 @@ ConfigDef* SchemaCreateConfigAt(Section* section, const char* store_utf8, const 
         std::lock_guard<std::mutex> lock(g_cfgMtx);
         g_configs.emplace_back(cfg);
     }
+    // H3: Load() applies the disk snapshot to `items`; it runs under the same
+    // registry lock that guards every items mutation, so a render frame can
+    // never observe a half-applied list.
     if (cfg->Load(StorePath(cfg->store))) {
         Log("[schema] store loaded: %s", cfg->store.c_str());
     }
@@ -173,6 +244,9 @@ ConfigDef* SchemaCreateConfigAt(Section* section, const char* store_utf8, const 
 }
 
 ConfigDef* SchemaCreateConfig(const char* store_utf8, const char* page_label_utf8) {
+    // H8: resolve the current section and create the page in one registry
+    // critical section - the node cannot disappear in between.
+    std::lock_guard<std::recursive_mutex> lock(RegistryMutex());
     Section* s = RegistryCurrentSection();
     if (!s) {
         Log("[schema] no current section for config %s (call SetSection first)",
@@ -194,12 +268,20 @@ ConfigDef* SchemaValidate(void* handle) {
 
 void SchemaSaveConfigNow(ConfigDef* cfg) {
     if (!cfg) return;
+    // H3: Save walks ConfigDef::items, which api.cpp mutates under the registry
+    // lock (ConfigAdd*). Taking the same recursive lock here keeps a render-thread
+    // save (key capture, menu button) from racing a mod thread's declaration.
+    // Lock order stays R -> C, the only order any path uses.
+    std::lock_guard<std::recursive_mutex> lock(RegistryMutex());
     if (cfg->Save(StorePath(cfg->store))) {
         Log("[schema] saved: %s", cfg->store.c_str());
     }
 }
 
 void SchemaSaveAllDirty() {
+    // H3: same lock as SchemaSaveConfigNow; it also guards the items walk and
+    // runs on the render thread at menu close, outside the frame's own lock.
+    std::lock_guard<std::recursive_mutex> registryLock(RegistryMutex());
     std::lock_guard<std::mutex> lock(g_cfgMtx);
     for (auto& cfg : g_configs) {
         if (cfg->dirty) {
@@ -211,13 +293,23 @@ void SchemaSaveAllDirty() {
 }
 
 // Rect of the most recently rendered schema item (automation aid).
+// L4: the probe thread reads it while the render thread writes it, and a rect
+// left over from the previous page would be reported as the current page's item;
+// the mutex keeps the 4-float snapshot consistent, the clear runs on page switch.
+std::mutex g_itemRectMtx;
 float g_lastItemRect[4] = { -1, -1, -1, -1 };
 
 bool SchemaGetLastItemRect(float out_xyxy[4]) {
     if (!out_xyxy) return false;
+    std::lock_guard<std::mutex> lock(g_itemRectMtx);
     if (g_lastItemRect[0] < 0) return false;
     for (int i = 0; i < 4; ++i) out_xyxy[i] = g_lastItemRect[i];
     return true;
+}
+
+void SchemaClearLastItemRect() {
+    std::lock_guard<std::mutex> lock(g_itemRectMtx);
+    g_lastItemRect[0] = g_lastItemRect[1] = g_lastItemRect[2] = g_lastItemRect[3] = -1;
 }
 
 void RenderSchemaForm(ConfigDef& cfg, const I18n& i18n, float dt) {
@@ -267,18 +359,22 @@ void RenderSchemaForm(ConfigDef& cfg, const I18n& i18n, float dt) {
                 break;
             }
             case SCH_KEY: {
-                ImGui::TextUnformatted(i18n.T(it.label.c_str()));
-                ImGui::SameLine(0.0f, 12.0f);
+                const char* label = i18n.T(it.label.c_str());
                 char kb[64];
                 snprintf(kb, sizeof(kb), "[%s]", Config::VkName((unsigned)it.ival));
+                const float buttonW = KeyButtonWidth(kb);
+                const bool sameLine =
+                    ImGui::CalcTextSize(label).x + 12.0f + buttonW <= ImGui::GetContentRegionAvail().x;
+                ImGui::TextUnformatted(label);
+                if (sameLine) ImGui::SameLine(0.0f, 12.0f);
                 bool capturing = g_captureMode.load(std::memory_order_relaxed) == 1 &&
                                  g_captureKind.load(std::memory_order_relaxed) == CAP_SCHEMA_KEY &&
                                  g_capCfg == (void*)&cfg && g_capItem == (void*)&it;
                 if (capturing) {
                     theme::PushCapturingStyle();
-                    ImGui::Button(i18n.T("capturing"), ImVec2(150.0f, 0.0f));
+                    ImGui::Button(i18n.T("capturing"), ImVec2(buttonW, 0.0f));
                     theme::PopCapturingStyle();
-                } else if (ImGui::Button(kb, ImVec2(150.0f, 0.0f))) {
+                } else if (ImGui::Button(kb, ImVec2(buttonW, 0.0f))) {
                     g_capCfg = (void*)&cfg;
                     g_capItem = (void*)&it;
                     g_captureKind.store(CAP_SCHEMA_KEY, std::memory_order_relaxed);
@@ -287,20 +383,24 @@ void RenderSchemaForm(ConfigDef& cfg, const I18n& i18n, float dt) {
                 break;
             }
             case SCH_KEYCOMBO: {
-                ImGui::TextUnformatted(i18n.T(it.label.c_str()));
-                ImGui::SameLine(0.0f, 12.0f);
+                const char* label = i18n.T(it.label.c_str());
                 unsigned vk = (unsigned)it.ival & 0xFFu;
                 unsigned mods = ((unsigned)it.ival >> 8) & 0xFu;
                 char kb[96];
                 snprintf(kb, sizeof(kb), "[%s]", Config::KeyModsToString(vk, mods).c_str());
+                const float buttonW = KeyButtonWidth(kb);
+                const bool sameLine =
+                    ImGui::CalcTextSize(label).x + 12.0f + buttonW <= ImGui::GetContentRegionAvail().x;
+                ImGui::TextUnformatted(label);
+                if (sameLine) ImGui::SameLine(0.0f, 12.0f);
                 bool capturing = g_captureMode.load(std::memory_order_relaxed) == 1 &&
                                  g_captureKind.load(std::memory_order_relaxed) == CAP_SCHEMA_KEYCOMBO &&
                                  g_capCfg == (void*)&cfg && g_capItem == (void*)&it;
                 if (capturing) {
                     theme::PushCapturingStyle();
-                    ImGui::Button(i18n.T("capturing"), ImVec2(150.0f, 0.0f));
+                    ImGui::Button(i18n.T("capturing"), ImVec2(buttonW, 0.0f));
                     theme::PopCapturingStyle();
-                } else if (ImGui::Button(kb, ImVec2(150.0f, 0.0f))) {
+                } else if (ImGui::Button(kb, ImVec2(buttonW, 0.0f))) {
                     g_capCfg = (void*)&cfg;
                     g_capItem = (void*)&it;
                     g_captureKind.store(CAP_SCHEMA_KEYCOMBO, std::memory_order_relaxed);
@@ -315,6 +415,7 @@ void RenderSchemaForm(ConfigDef& cfg, const I18n& i18n, float dt) {
         ImVec2 rb = ImGui::GetItemRectMax();
         if (!firstRectRecorded && it.type != SCH_GROUP) {
             firstRectRecorded = true;
+            std::lock_guard<std::mutex> lock(g_itemRectMtx);
             g_lastItemRect[0] = ra.x;
             g_lastItemRect[1] = ra.y;
             g_lastItemRect[2] = rb.x;

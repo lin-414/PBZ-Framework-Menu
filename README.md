@@ -6,7 +6,7 @@
 **快捷键呼出的游戏内设置界面**、多语言、以及可由框架统一编辑的模组配置（含键位）。
 模组如何注册自己的分区、设置页与热键，见《模组作者接入指南》。
 
-当前状态：**0.5.0**。输入方案与截图直通（0.2.0/0.3.3）已实机验证，机制与实机铁律
+当前状态：**0.5.2**。输入方案与截图直通（0.2.0/0.3.3）已实机验证，机制与实机铁律
 详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)；验证记录在
 [docs/VERIFIED.md](docs/VERIFIED.md)。0.4.0 是面向模组作者的一版（SDK API 版本 2）：
 
@@ -22,7 +22,7 @@
 - **分区生命周期**：\`RenameSection\` / \`DeleteSection\` / \`RemoveSectionItem\`；
 - **纹理 API**：\`LoadTexture\` / \`Image\` / \`DisposeTexture\`（stb_image，渲染线程上传）；
 - **Widget 扩充**：InputText / CollapsingHeader / Selectable / ProgressBar / ColorEdit3；
-- **玩家侧**：侧边栏搜索框、主题 JSON（\`themes\<name>.json\` + 设置页选择器）；
+- **玩家侧**：主题 JSON（\`themes\<name>.json\` + 设置页选择器）、面板缩放联动（拖拽调整面板大小时字体与布局等比缩放）；
 - **工程化**：MIT LICENSE（SDK 头对客户端模组零义务）、THIRD_PARTY_NOTICES、DLL 版本
   资源（版本单一来源 CMakeLists）、CMakePresets/.clang-format、i18n 单测进 CTest。
 
@@ -58,7 +58,7 @@ ctest --test-dir build   :: i18n 单测（也可手动跑 build\i18n_test.exe）
 ## 游戏内安装（用户用模组管理器自行完成，自动化不碰游戏目录）
 
 1. 安装 [UE4SS for PBZ](https://www.nexusmods.com/phantombladezero/mods/5)（KintaroModding fork）。
-2. 用模组管理器（或手动解压）把 `dist/PBZ-Framework-Menu_0.5.0.zip` 装到
+2. 用模组管理器（或手动解压）把 `dist/PBZ-Framework-Menu_0.5.2.zip` 装到
    `<游戏目录>\platform\steam\ue4ss\Mods\`，形成
    `ue4ss\Mods\PBZFM\{dlls\PBZFM.dll, enabled.txt, PBZFM.ini, languages\}`。
 3. 启动游戏按 F8；验证清单见包内 README.txt。排障先看 `Documents\PBZ\Logs\PBZFM.log`
@@ -85,7 +85,7 @@ MIT，见 [LICENSE](LICENSE)。**SDK 头（sdk/pbzfm.h）对客户端模组零�
 src/            PBZFM.dll 源码（pbzfm 入口 / overlay DComp 渲染 / input 钩子 /
                 gamepad XInput 手柄 / game_window 定位与子类化 / config / i18n / menu /
                 theme（含 JSON 主题）/ textures / api+registry+schema 模组注册 C API）
-sdk/            模组接入头文件 pbzfm.h（ABI v2：可选解析 + 兼容策略随头分发）
+sdk/            模组接入头文件 pbzfm.h（API v3：可选解析 + 兼容策略随头分发）
 host/           测试宿主（模拟 UnrealWindow + 脚本输入 + 截图；demo_mod.cpp 为模组接入参考实现）
 assets/         随包分发文件（PBZFM.ini、languages/*.json、README.txt）
 tests/          i18n 单测（CTest）
@@ -104,7 +104,7 @@ docs/           架构与实机铁律 / 接入指南 / 验证记录 / 自测截�
    源码保留在 src/gamepad.*（未编译，恢复步骤见 gamepad.h 头注）。剩余：游戏暂停
    （复用 PBZPhotoMode 已验证的暂停栈）。
 3. 把 PBZPhotoMode 的 ImGui 诊断面板接成第一个客户端（其 MenuView/MenuActions 快照桥
-   直接复用），顺带压测 SDK v2 的事件/纹理/生命周期路径。
+   直接复用），顺带压测 SDK v3 的事件/纹理/生命周期路径。
 4. 参考项目已验证可行的后续方向：每模组翻译文件（languages/<store>.json，模组自带
    翻译不必等框架发版）、自定义字体文件夹 + 字形范围开关、呼出键模式（双击/长按 +
    ConsumeToggleKey）、模组分组/归档/排序（0.5.0 已有分类树，模组组织仍开放）、

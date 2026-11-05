@@ -11,11 +11,11 @@
 #include "registry.h"
 #include "schema.h"
 #include "theme.h"
+#include "input.h"
 
 #include <imgui.h>
 #include <algorithm>
 #include <cstdio>
-#include <cstring>
 #include <set>
 #include <string>
 #include <vector>
@@ -31,23 +31,6 @@ I18n* s_i18n = nullptr;
 MenuUi* s_ui = nullptr;
 bool s_frameworkRegistered = false;
 
-// ASCII case-insensitive substring; non-ASCII UTF-8 bytes compare as-is, so
-// CJK names filter by exact byte prefix too.
-bool SidebarFilterMatch(const char* hay, const char* needle) {
-    if (!needle || !*needle) return true;
-    if (!hay) return false;
-    auto fold = [](char c) { return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c; };
-    const size_t nlen = strlen(needle);
-    const size_t hlen = strlen(hay);
-    if (nlen > hlen) return false;
-    for (size_t i = 0; i + nlen <= hlen; ++i) {
-        size_t j = 0;
-        while (j < nlen && fold(hay[i + j]) == fold(needle[j])) ++j;
-        if (j == nlen) return true;
-    }
-    return false;
-}
-
 // First node carrying content, depth-first: used to land somewhere sensible
 // when a selection vanishes or on the first frame.
 const Section* FirstContentNode(const Section& n, int* pageIdx) {
@@ -61,22 +44,8 @@ const Section* FirstContentNode(const Section& n, int* pageIdx) {
     return nullptr;
 }
 
-// A node stays visible under the search filter when it, one of its pages, or
-// any descendant matches. While filtering the whole tree renders expanded.
-bool SubtreeMatchesFilter(const Section& n, const char* needle) {
-    if (SidebarFilterMatch(n.name.c_str(), needle)) return true;
-    for (const auto& p : n.pages) {
-        if (SidebarFilterMatch(p.label.c_str(), needle)) return true;
-    }
-    for (const auto& c : n.children) {
-        if (SubtreeMatchesFilter(*c, needle)) return true;
-    }
-    return false;
-}
-
 struct TreeCtx {
     I18n* i18n;
-    const char* search;                 // "" = no filter
     std::string* selPath;
     int* selPage;
     bool* selSettings;
@@ -90,11 +59,8 @@ struct TreeCtx {
 // there is no separate caret widget) and selects the row; a node without its
 // own content lands the selection on its first page when it expands.
 void RenderTreeNode(Section& node, int depth, TreeCtx& tc) {
-    const bool filtering = tc.search[0] != 0;
-    if (filtering && !SubtreeMatchesFilter(node, tc.search)) return;
-
     const std::string path = RegistryPathOf(&node);
-    const bool open = filtering || tc.expanded->count(path) != 0;
+    const bool open = tc.expanded->count(path) != 0;
     const bool expandable = !node.children.empty() || node.pages.size() > 1;
     const bool sel = !*tc.selSettings && *tc.selPath == path;
 
@@ -228,9 +194,12 @@ void FrameworkSettingsPage(void*) {
         // Theme picker: "ink" is the built-in 玄墨鎏金, anything else is a
         // themes\<name>.json over the built-in style (layout paddings stay
         // fixed for the host automation).
-        std::vector<std::string> names = theme::ListThemeNames();
         std::string cur = cfg.theme == "ink" ? i18n.T("theme_builtin") : cfg.theme;
         if (ImGui::BeginCombo(i18n.T("theme"), cur.c_str())) {
+            // M4: rescan only when the popup appears; the cached list is reused
+            // on every other frame instead of enumerating themes\ at 60 Hz.
+            if (ImGui::IsWindowAppearing()) theme::RefreshThemeNames();
+            const std::vector<std::string>& names = theme::ListThemeNames();
             for (const std::string& n : names) {
                 std::string label = (n == "ink") ? i18n.T("theme_builtin") : n;
                 bool sel = cfg.theme == n;
@@ -254,9 +223,9 @@ void FrameworkSettingsPage(void*) {
                            g_captureKind.load(std::memory_order_relaxed) == CAP_TOGGLE;
     if (capturingToggle) {
         theme::PushCapturingStyle();
-        ImGui::Button(i18n.T("capturing"), ImVec2(150.0f, 0.0f));
+        ImGui::Button(i18n.T("capturing"), ImVec2(150.0f * ui.zoom, 0.0f));
         theme::PopCapturingStyle();
-    } else if (ImGui::Button(keyLabel, ImVec2(150.0f, 0.0f))) {
+    } else if (ImGui::Button(keyLabel, ImVec2(150.0f * ui.zoom, 0.0f))) {
         g_captureKind.store(CAP_TOGGLE, std::memory_order_relaxed);
         g_captureMode.store(1, std::memory_order_relaxed);
     }
@@ -265,7 +234,7 @@ void FrameworkSettingsPage(void*) {
 
     // N卡/PixPin 这类全局截图工具的热键在菜单打开期间被输入隔离拦截（它们也无法
     // 用鼠标选区），所以框架自带一张"含界面"的屏幕截图。
-    if (ImGui::Button(i18n.T("screenshot"), ImVec2(150.0f, 0.0f))) {
+    if (ImGui::Button(i18n.T("screenshot"), ImVec2(150.0f * ui.zoom, 0.0f))) {
         ui.requestScreenshot = true;
         ui.shotFlash = 2.0f;
     }
@@ -274,22 +243,56 @@ void FrameworkSettingsPage(void*) {
         ImGui::TextDisabled("%s", i18n.T("shot_saved"));
     }
 
-    // Passthrough status: what the ini lets through to screenshot tools while
-    // the menu owns the input (configured in PBZFM.ini, read at load time).
+    // Screenshot-tool passthrough chords, editable in place: click a chord to
+    // re-capture it (the shared key-capture flow records the held modifiers),
+    // x removes it, "add" appends one. Edits persist to PBZFM.ini and are
+    // handed to the running hook immediately - no restart needed.
+    ImGui::TextUnformatted(i18n.T("passthrough"));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", i18n.T("passthrough_hint"));
     {
-        std::string chords;
-        for (size_t i = 0; i < cfg.passthroughKeys.size(); ++i) {
-            if (i) chords += ", ";
-            chords += Config::ChordToString(cfg.passthroughKeys[i]);
+        const float rowW = 150.0f * ui.zoom;
+        int removeIdx = -1;
+        for (int i = 0; i < (int)cfg.passthroughKeys.size(); ++i) {
+            ImGui::PushID(i);
+            const bool capturingThis =
+                g_captureMode.load(std::memory_order_relaxed) == 1 &&
+                g_captureKind.load(std::memory_order_relaxed) == CAP_PASSTHROUGH &&
+                g_captureIndex.load(std::memory_order_relaxed) == i;
+            char label[96];
+            snprintf(label, sizeof(label), "[%s]", Config::ChordToString(cfg.passthroughKeys[i]).c_str());
+            if (capturingThis) {
+                theme::PushCapturingStyle();
+                ImGui::Button(i18n.T("capturing"), ImVec2(rowW, 0.0f));
+                theme::PopCapturingStyle();
+            } else if (ImGui::Button(label, ImVec2(rowW, 0.0f))) {
+                g_captureIndex.store(i, std::memory_order_relaxed);
+                g_captureKind.store(CAP_PASSTHROUGH, std::memory_order_relaxed);
+                g_captureMode.store(1, std::memory_order_relaxed);
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", i18n.T("passthrough_edit_tip"));
+            ImGui::SameLine();
+            if (ImGui::Button("x", ImVec2(24.0f * ui.zoom, 0.0f))) removeIdx = i;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", i18n.T("passthrough_del_tip"));
+            ImGui::PopID();
         }
-        ImGui::TextDisabled("%s: %s", i18n.T("passthrough"),
-                            chords.empty() ? "-" : chords.c_str());
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", i18n.T("passthrough_hint"));
+        if (removeIdx >= 0) {
+            cfg.passthroughKeys.erase(cfg.passthroughKeys.begin() + removeIdx);
+            ui.requestSave = true;
+            InputSetPassthrough(cfg.passthroughKeys, cfg.passthroughReplay);
+            Log("[ui] passthrough chord removed (remaining %d)", (int)cfg.passthroughKeys.size());
+        }
+        if ((int)cfg.passthroughKeys.size() < 8) {
+            if (ImGui::Button(i18n.T("passthrough_add"), ImVec2(rowW, 0.0f))) {
+                g_captureIndex.store(-1, std::memory_order_relaxed);
+                g_captureKind.store(CAP_PASSTHROUGH, std::memory_order_relaxed);
+                g_captureMode.store(1, std::memory_order_relaxed);
+            }
+        }
     }
 
     ImGui::Separator();
 
-    if (ImGui::Button(i18n.T("save"), ImVec2(150.0f, 0.0f))) {
+    if (ImGui::Button(i18n.T("save"), ImVec2(150.0f * ui.zoom, 0.0f))) {
         ui.requestSave = true;
         ui.saveFlash = 2.0f;
     }
@@ -303,7 +306,16 @@ void FrameworkSettingsPage(void*) {
 
 void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
     ImGuiStyle& st = ImGui::GetStyle();
-    st.FontScaleMain = cfg.uiScale;
+
+    // Resize zoom: the panel acts as a zoom target - font size and the fixed
+    // pixel widths around it (sidebar, buttons) track the panel width, so a
+    // bigger panel shows a bigger UI instead of just more empty space. Uses
+    // last frame's width: this frame's size is only known after Begin(), and
+    // the one-frame lag is invisible. The final font stays inside the range of
+    // the ui_scale slider so extreme panel sizes can't produce absurd glyphs.
+    const float zoomMin = layout::kPanelMinW / layout::kPanelW;
+    ui.zoom = (ui.panelW > 1.0f) ? std::clamp(ui.panelW / layout::kPanelW, zoomMin, 2.0f) : 1.0f;
+    st.FontScaleMain = std::clamp(cfg.uiScale * ui.zoom, 0.7f, 1.8f);
     if (ui.saveFlash > 0.0f) ui.saveFlash -= dt;
     if (ui.shotFlash > 0.0f) ui.shotFlash -= dt;
     ui.capturing = g_captureMode.load(std::memory_order_relaxed) == 1;
@@ -333,6 +345,7 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
     ImGui::Begin(i18n.T("title"), nullptr,
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
     ImGui::PopStyleColor(4);
+    ui.panelW = ImGui::GetWindowSize().x;   // feeds next frame's zoom
 
     // Title-bar close button: square, hairline frame, cinnabar on hover - the
     // game's corner-exit idiom. Widget flow: cursor is moved into the title
@@ -402,8 +415,15 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
     static bool selSettings = false;
     static std::set<std::string> expanded;
 
+    // Review H5: before drawing any page, drop callbacks whose mod DLL
+    // hot-unloaded. Pages keep their row but a cleared fn renders as empty
+    // content instead of jumping into unmapped code.
+    RegistryPurgeOrphanedCallbacks();
+
     // Hold the registry for the whole frame: registration from other threads
     // waits at most one frame; our own recursive calls stay legal.
+    // Review H3: api.cpp's ConfigAdd*/Get*/Set* take this same mutex, so a mod
+    // thread can never mutate ConfigDef::items while the frame walks them.
     std::lock_guard<std::recursive_mutex> lock(RegistryMutex());
     auto& sections = RegistrySections();
 
@@ -430,17 +450,10 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
     // them past the bottom edge, out of view).
     const float footBand = st.ItemSpacing.y + ImGui::GetFrameHeight();
 
-    ImGui::BeginChild("##sections", ImVec2(190.0f, -footBand));
+    ImGui::BeginChild("##sections", ImVec2(layout::kSidebarW * ui.zoom, -footBand));
     RegistryResetSectionRects();
-    // Sidebar search: filters whole subtrees by (translated or raw) name
-    // substring; while filtering everything renders expanded and the current
-    // selection stays put even when filtered out.
-    static char search[64] = "";
-    ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputTextWithHint("##search", i18n.T("search_hint"), search, sizeof(search));
     TreeCtx tc;
     tc.i18n = &i18n;
-    tc.search = search;
     tc.selPath = &selPath;
     tc.selPage = &selPage;
     tc.selSettings = &selSettings;
@@ -472,6 +485,9 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
         contentPage = selPage;
     }
     if (!contentNode) {
+        // L4: nothing is rendered from a schema here, so a rect left over from
+        // the previous page must not be reported as this page's item.
+        SchemaClearLastItemRect();
         // Nothing picked yet (or the picked node was removed): invite instead
         // of silently showing some mod's page.
         ImGui::TextDisabled("%s", i18n.T("select_hint"));
@@ -506,6 +522,9 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
             RenderSchemaForm(*(ConfigDef*)pg.schemaCfg, i18n, dt);
         }
     }
+    // L4: custom-widget pages never record a rect; keep the previous page's
+    // rect from being reported while such a page is shown.
+    if (!currentSchema) SchemaClearLastItemRect();
     ImGui::EndChild();
 
     // Footer row, pinned to the panel's bottom-left corner: the framework
@@ -514,14 +533,14 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
     ImGui::SetCursorPosX(st.WindowPadding.x);
     const bool settingsOpen = selSettings;
     if (settingsOpen) ImGui::PushStyleColor(ImGuiCol_Text, theme::kGoldBright);
-    if (ImGui::Button(i18n.T("page_settings"), ImVec2(150.0f, 0.0f))) {
+    if (ImGui::Button(i18n.T("page_settings"), ImVec2(150.0f * ui.zoom, 0.0f))) {
         selSettings = true;
         selPage = 0;
     }
     if (settingsOpen) ImGui::PopStyleColor();
     if (currentSchema) {
         ImGui::SameLine();
-        if (ImGui::Button(i18n.T("save"), ImVec2(150.0f, 0.0f))) {
+        if (ImGui::Button(i18n.T("save"), ImVec2(150.0f * ui.zoom, 0.0f))) {
             SchemaSaveConfigNow(currentSchema);
             ui.saveFlash = 2.0f;
         }

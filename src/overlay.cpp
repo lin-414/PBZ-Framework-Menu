@@ -27,6 +27,7 @@
 #include <imgui_impl_dx11.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <vector>
 
@@ -47,12 +48,28 @@ typedef HRESULT(WINAPI* PFN_D3DCompile)(LPCVOID pSrcData, SIZE_T SrcDataSize, LP
     const D3D_SHADER_MACRO* pDefines, ID3DInclude* pInclude, LPCSTR pEntrypoint, LPCSTR pTarget,
     UINT Flags1, UINT Flags2, ID3DBlob** ppCode, ID3DBlob** ppErrorMsgs);
 
-constexpr wchar_t kOverlayClass[] = L"PBZFMOverlayWnd";
+constexpr wchar_t kOverlayClassBase[] = L"PBZFMOverlayWnd";
+
+// H1: raw-input ownership state machine. `rawList` is only meaningful in the
+// StolenWithGameEntry state (the game's exact registrations captured before we
+// re-pointed the mouse entry at our overlay).
+enum RawMouseState {
+    kRawNotStolen,          // nothing of ours registered; restore is a no-op
+    kRawStolenWithGameEntry,// our sink replaced a game mouse entry; rawList must be put back
+    kRawStealFailed,         // RegisterRawInputDevices failed; the game's entry is untouched
+    kRawStolenOnlyOurs       // no game mouse entry existed; remove only our sink on close
+};
 
 struct Overlay {
     HWND hwnd = nullptr;
     bool visible = false;
     int  w = 0, h = 0;
+    // H7: the overlay window class is registered under THIS DLL's module with a
+    // process/time-unique name, so a hot-reloaded DLL never inherits the atom of
+    // a previous instance (whose WndProc may already be unmapped).
+    std::wstring className;
+    HINSTANCE classInstance = nullptr;
+    bool classRegistered = false;
 
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
@@ -67,7 +84,20 @@ struct Overlay {
     ComPtr<IDCompositionTarget> dtarget;
     ComPtr<IDCompositionVisual> dvisual;
 
+    // M11: the graphics DLL handles are cached for the process lifetime: a
+    // rebuild reuses them instead of loading d3dcompiler a second time, and
+    // CleanupGraphics releases them once.
+    HMODULE hD3d11 = nullptr;
+    HMODULE hDxgi = nullptr;
+    HMODULE hDcomp = nullptr;
+    HMODULE hD3dc = nullptr;
+
     bool imguiReady = false;
+    // M12: device-removed/reset requests a rebuild on the next frame; if that
+    // also fails the overlay degrades to inert instead of drawing into a dead
+    // device or a null RTV.
+    bool rebuildPending = false;
+    bool graphicsLost = false;
     bool cursorHiddenByUs = false;  // we hid a previously visible cursor, restore on close
     bool mousePosValid = false;     // ImGui mouse position known since menu open
     bool cursorVerifyPending = false;   // log the actual cursor state ~1s after restore
@@ -80,7 +110,7 @@ struct Overlay {
     bool gameWasFg = false;            // foreground edge detector for the reclaim watchdog
     LARGE_INTEGER rawWatchNext{};      // periodic raw-input ownership check (4 Hz)
     std::vector<RAWINPUTDEVICE> rawList;   // game's raw-input registrations, saved on open
-    bool rawListSaved = false;
+    RawMouseState rawState = kRawNotStolen;
 
     GameWindow* gw = nullptr;
     Config* cfg = nullptr;
@@ -104,12 +134,28 @@ LRESULT CALLBACK OverlayWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 // (INPUTSINK) and the game's exact saved list is restored on close - never
 // RIDEV_REMOVE (that leaves the game without its registration and its camera
 // dead until restart, verified in-game 2026-11-01).
+bool RawMouseIsOurs();   // defined below; the steal checks ownership first
+
 bool StealGameRawMouse() {
+    // H1: never save an already-stolen list as "the game's". If our sink is
+    // still current, re-stealing would capture OUR entry into rawList and the
+    // close-time restore would re-register our own sink instead of the game's
+    // (camera dead until restart).
+    if (RawMouseIsOurs()) {
+        Log("[ov] raw mouse already points at the overlay - steal skipped");
+        return true;
+    }
+
     UINT n = 0;
     GetRegisteredRawInputDevices(nullptr, &n, sizeof(RAWINPUTDEVICE));
     std::vector<RAWINPUTDEVICE> saved(n);
     UINT got = n;
-    if (n > 0 && GetRegisteredRawInputDevices(saved.data(), &got, sizeof(RAWINPUTDEVICE)) == 0) return false;
+    if (n > 0 && GetRegisteredRawInputDevices(saved.data(), &got, sizeof(RAWINPUTDEVICE)) == 0) {
+        Log("[ov] ERROR: raw input query failed err=%lu - not stealing (game input untouched)",
+            GetLastError());
+        g_ov.rawState = kRawStealFailed;
+        return false;
+    }
     saved.resize(got);
 
     RAWINPUTDEVICE ours{};
@@ -131,36 +177,78 @@ bool StealGameRawMouse() {
     if (!hadMouse) next.push_back(ours);
 
     if (!RegisterRawInputDevices(next.data(), (UINT)next.size(), sizeof(RAWINPUTDEVICE))) {
-        Log("[ov] raw mouse re-point failed err=%lu", GetLastError());
+        // H1: a failed steal leaves the process-wide registration exactly as it
+        // was. Record that so close does NOT run the "remove our sink" branch
+        // (which would delete the game's live entry).
+        Log("[ov] ERROR: raw mouse re-point failed err=%lu - game input untouched", GetLastError());
+        g_ov.rawState = kRawStealFailed;
         return false;
     }
-    g_ov.rawList = saved;
-    g_ov.rawListSaved = true;
-    Log("[ov] raw mouse re-pointed to overlay (%u entries saved)", (unsigned)got);
+    g_ov.rawList = std::move(saved);
+    g_ov.rawState = hadMouse ? kRawStolenWithGameEntry : kRawStolenOnlyOurs;
+    Log("[ov] raw mouse re-pointed to overlay (%u entries saved, state=%s)", (unsigned)got,
+        hadMouse ? "with-game-entry" : "only-ours");
     return true;
 }
 
 void RestoreGameRawMouse() {
-    // A saved list can be empty (nothing was registered before us): with no
-    // game entry to restore, fall through to removing ours - registering an
-    // empty list fails with ERROR_INVALID_PARAMETER and would leave our
-    // overlay registration live while reporting a restore.
-    if (g_ov.rawListSaved && !g_ov.rawList.empty()) {
-        if (!RegisterRawInputDevices(g_ov.rawList.data(), (UINT)g_ov.rawList.size(), sizeof(RAWINPUTDEVICE)))
-            Log("[ov] WARNING: raw input restore failed err=%lu", GetLastError());
-        else
-            Log("[ov] raw input registrations restored to game");
-        g_ov.rawListSaved = false;
-    } else {
-        // We registered without a game entry existing: remove only ours.
+    // H1: a failed steal must never trigger a restore - the game's registration
+    // was never replaced, so any registration call here could only damage it.
+    if (g_ov.rawState == kRawStealFailed) {
+        Log("[ov] raw mouse: earlier steal failed - nothing to restore");
+        g_ov.rawState = kRawNotStolen;
+        return;
+    }
+    // H1: re-query ownership before transitioning. The game re-registers raw
+    // input when it regains focus / reinitialises its input stack, which replaces
+    // our entry; calling RIDEV_REMOVE then would destroy the game's fresh
+    // registration and freeze its camera until restart.
+    if (!RawMouseIsOurs()) {
+        if (g_ov.rawState != kRawNotStolen)
+            Log("[ov] raw mouse: registration was replaced by the game - nothing to restore");
+        g_ov.rawList.clear();
+        g_ov.rawState = kRawNotStolen;
+        return;
+    }
+    if (g_ov.rawState == kRawStolenWithGameEntry) {
+        if (g_ov.rawList.empty()) {
+            // Cannot happen with the steal code above, but never fall through to
+            // RIDEV_REMOVE: removing would kill the game's mouse registration.
+            Log("[ov] ERROR: restore list empty in stolen state - leaving registrations untouched");
+            return;
+        }
+        if (!RegisterRawInputDevices(g_ov.rawList.data(), (UINT)g_ov.rawList.size(), sizeof(RAWINPUTDEVICE))) {
+            // H1: report as an error and keep state/list so a later attempt can
+            // still restore; a silent WARNING would hide a dead camera.
+            Log("[ov] ERROR: raw input restore failed err=%lu (game camera may stay frozen)",
+                GetLastError());
+            return;
+        }
+        Log("[ov] raw input registrations restored to game");
+        g_ov.rawList.clear();
+        g_ov.rawState = kRawNotStolen;
+        return;
+    }
+    if (g_ov.rawState == kRawStolenOnlyOurs) {
+        // Nothing existed before us, so removing our sink returns the process to
+        // that exact state. Safe ONLY because RawMouseIsOurs() above confirmed
+        // the live entry is still the one we registered.
         RAWINPUTDEVICE rm{};
         rm.usUsagePage = 0x01;
         rm.usUsage = 0x02;
-        rm.dwFlags = RIDEV_REMOVE;   // safe: no game mouse entry exists to destroy
+        rm.dwFlags = RIDEV_REMOVE;
         rm.hwndTarget = nullptr;
-        if (!RegisterRawInputDevices(&rm, 1, sizeof(rm)))
-            Log("[ov] raw mouse removal failed err=%lu", GetLastError());
+        if (!RegisterRawInputDevices(&rm, 1, sizeof(rm))) {
+            Log("[ov] ERROR: raw sink removal failed err=%lu", GetLastError());
+            return;
+        }
+        Log("[ov] raw mouse sink removed (no game entry existed before the steal)");
+        g_ov.rawState = kRawNotStolen;
+        return;
     }
+    // kRawNotStolen but our hwnd owns the entry: the state was lost (e.g. DLL
+    // hot-reloaded mid-session). Leave it alone - see the RIDEV_REMOVE warning.
+    Log("[ov] raw mouse: ours is live without a saved state - leaving it untouched");
 }
 
 // True while the process-wide mouse raw-input entry still points at our
@@ -182,6 +270,36 @@ bool RawMouseIsOurs() {
     }
     return false;   // no mouse entry at all - ours is gone, steal again
 }
+
+// M10: lives outside the anonymous namespace so the test hook in pbzfm.cpp
+// calls the exact encoder the capture path uses; the banner below restores it.
+} // namespace
+
+// M10: 32bpp DIB pixels are BGRA and BitBlt leaves the alpha byte at 0, so a
+// 4-channel PNG came out fully transparent. Convert to RGBA and force alpha to
+// 255 in the same pass; every capture path (and the host's alpha test) goes
+// through this one encoder.
+bool EncodeOpaqueBgraPng(const unsigned char* bgra, int w, int h, std::vector<unsigned char>& png) {
+    if (!bgra || w <= 0 || h <= 0) return false;
+    std::vector<unsigned char> rgba((size_t)w * (size_t)h * 4);
+    const size_t n = (size_t)w * (size_t)h;
+    for (size_t i = 0; i < n; ++i) {
+        rgba[i * 4 + 0] = bgra[i * 4 + 2];
+        rgba[i * 4 + 1] = bgra[i * 4 + 1];
+        rgba[i * 4 + 2] = bgra[i * 4 + 0];
+        rgba[i * 4 + 3] = 255;   // DIB alpha is 0, not a real transparency value
+    }
+    png.clear();
+    png.reserve(rgba.size());
+    stbi_write_png_to_func([](void* ctx, void* data, int size) {
+        auto* out = (std::vector<unsigned char>*)ctx;
+        const auto* p = (const unsigned char*)data;
+        out->insert(out->end(), p, p + size);
+    }, &png, w, h, 4, rgba.data(), w * 4);
+    return !png.empty();
+}
+
+namespace {
 
 // Full composited-desktop capture of the game window region: DWM hands us the
 // final image, so the menu overlay itself is in the shot - N卡/PixPin style
@@ -208,15 +326,7 @@ static void CaptureGameScreen() {
             HGDIOBJ old = SelectObject(mem, bmp);
             BitBlt(mem, 0, 0, gw->w, gw->h, screen, gw->x, gw->y, SRCCOPY);
             SelectObject(mem, old);
-            auto* px = (unsigned char*)bits;
-            for (int i = 0; i < gw->w * gw->h; ++i) std::swap(px[i * 4 + 0], px[i * 4 + 2]);  // BGRA -> RGBA
-            png.reserve((size_t)gw->w * gw->h * 4);
-            stbi_write_png_to_func([](void* ctx, void* data, int size) {
-                auto* out = (std::vector<unsigned char>*)ctx;
-                const auto* p = (const unsigned char*)data;
-                out->insert(out->end(), p, p + size);
-            }, &png, gw->w, gw->h, 4, px, gw->w * 4);
-            ok = !png.empty();
+            ok = EncodeOpaqueBgraPng((const unsigned char*)bits, gw->w, gw->h, png);
         }
         if (bmp) DeleteObject(bmp);
         DeleteDC(mem);
@@ -240,52 +350,108 @@ static void CaptureGameScreen() {
     Log("[ov] screenshot %ls (%dx%d, %zu bytes)", wide, gw->w, gw->h, png.size());
 }
 
+// H7: window classes must be registered under the DLL's own module (the game
+// exe's HINSTANCE was the old (wrong) owner) and that same handle is required to
+// unregister the class at shutdown.
+HMODULE OverlayModule() {
+    static HMODULE m = [] {
+        HMODULE h = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)(uintptr_t)&OverlayModule, &h);
+        return h;
+    }();
+    return m;
+}
+
+void UnregisterOverlayWindowClass();   // H7: definition follows CleanupGraphics
+
 bool CreateOverlayWindow() {
+    const HMODULE self = OverlayModule();
+    if (!self) {
+        Log("[ov] failed to resolve own module for the overlay window class");
+        return false;
+    }
+    // H7: a unique class name means a hot-reloaded DLL can never pick up the atom
+    // registered by its previous instance (whose OverlayWndProc is unmapped).
+    wchar_t cls[96];
+    swprintf(cls, 96, L"%s_%08lX_%llX", kOverlayClassBase, (unsigned long)GetCurrentProcessId(),
+             (unsigned long long)GetTickCount64());
+    g_ov.className = cls;
+
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = OverlayWndProc;
-    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hInstance = (HINSTANCE)self;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.lpszClassName = kOverlayClass;
-    if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        Log("[ov] RegisterClassEx failed err=%lu", GetLastError());
+    wc.lpszClassName = g_ov.className.c_str();
+    if (!RegisterClassExW(&wc)) {
+        // H7: refuse rather than reuse a same-named class - it could be owned by
+        // someone else or by an older instance of this DLL.
+        const DWORD err = GetLastError();
+        Log("[ov] ERROR: RegisterClassEx failed err=%lu (class=%ls) - overlay aborted", err, cls);
+        g_ov.className.clear();
         return false;
     }
+    g_ov.classRegistered = true;
+    g_ov.classInstance = (HINSTANCE)self;
+
     g_ov.w = g_ov.gw->w;
     g_ov.h = g_ov.gw->h;
     g_ov.hwnd = CreateWindowExW(
         WS_EX_NOREDIRECTIONBITMAP | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-        kOverlayClass, L"PBZFM Overlay", WS_POPUP,
+        g_ov.className.c_str(), L"PBZFM Overlay", WS_POPUP,
         g_ov.gw->x, g_ov.gw->y, g_ov.w, g_ov.h,
-        nullptr, nullptr, wc.hInstance, nullptr);
+        nullptr, nullptr, (HINSTANCE)self, nullptr);
     if (!g_ov.hwnd) {
         Log("[ov] CreateWindowEx failed err=%lu", GetLastError());
+        // The class atom stays until OverlayStop/cleanup; leaving it registered
+        // is harmless (unique name) but we still drop it when no window uses it.
+        UnregisterOverlayWindowClass();
         return false;
     }
-    Log("[ov] overlay window created (%dx%d at %d,%d)", g_ov.w, g_ov.h, g_ov.gw->x, g_ov.gw->y);
+    Log("[ov] overlay window created (%dx%d at %d,%d, class=%ls)", g_ov.w, g_ov.h, g_ov.gw->x, g_ov.gw->y, cls);
     return true;
 }
 
 bool LoadGraphicsApis(PFN_D3D11CreateDevice* d3dCreate, PFN_CreateDXGIFactory2* factory2,
                       PFN_DCompositionCreateDevice* dcompCreate, PFN_D3DCompile* d3dCompile) {
-    HMODULE hd3d11 = LoadLibraryW(L"d3d11.dll");
-    HMODULE hdxgi = LoadLibraryW(L"dxgi.dll");
-    HMODULE hdcomp = LoadLibraryW(L"dcomp.dll");
-    HMODULE hd3dc = LoadLibraryW(L"d3dcompiler_47.dll");
-    if (!hd3d11 || !hdxgi || !hdcomp || !hd3dc) {
-        Log("[ov] graphics dll load failed: d3d11=%p dxgi=%p dcomp=%p d3dcompiler=%p",
-            (void*)hd3d11, (void*)hdxgi, (void*)hdcomp, (void*)hd3dc);
+    // M11: bare LoadLibraryW resolves against the game directory first, so a
+    // planted d3d11.dll could win; System32-only loading pins the OS copy.
+    // Handles are cached in g_ov and reused by a device rebuild, then freed in
+    // CleanupGraphics (the old code leaked every handle and loaded d3dcompiler
+    // twice).
+    wchar_t sysDir[MAX_PATH]{};
+    if (!GetSystemDirectoryW(sysDir, MAX_PATH)) {
+        Log("[ov] GetSystemDirectoryW failed err=%lu", GetLastError());
         return false;
     }
-    *d3dCreate = (PFN_D3D11CreateDevice)GetProcAddress(hd3d11, "D3D11CreateDevice");
-    *factory2 = (PFN_CreateDXGIFactory2)GetProcAddress(hdxgi, "CreateDXGIFactory2");
-    *dcompCreate = (PFN_DCompositionCreateDevice)GetProcAddress(hdcomp, "DCompositionCreateDevice");
-    *d3dCompile = (PFN_D3DCompile)GetProcAddress(hd3dc, "D3DCompile");
+    auto load = [&](HMODULE& slot, const wchar_t* name) {
+        if (slot) return true;   // already loaded by a previous (re)build
+        std::wstring path = std::wstring(sysDir) + L"\\" + name;
+        slot = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!slot) Log("[ov] load %ls failed err=%lu", path.c_str(), GetLastError());
+        return slot != nullptr;
+    };
+    if (!load(g_ov.hD3d11, L"d3d11.dll") || !load(g_ov.hDxgi, L"dxgi.dll") ||
+        !load(g_ov.hDcomp, L"dcomp.dll") || !load(g_ov.hD3dc, L"d3dcompiler_47.dll")) {
+        return false;
+    }
+    *d3dCreate = (PFN_D3D11CreateDevice)GetProcAddress(g_ov.hD3d11, "D3D11CreateDevice");
+    *factory2 = (PFN_CreateDXGIFactory2)GetProcAddress(g_ov.hDxgi, "CreateDXGIFactory2");
+    *dcompCreate = (PFN_DCompositionCreateDevice)GetProcAddress(g_ov.hDcomp, "DCompositionCreateDevice");
+    *d3dCompile = (PFN_D3DCompile)GetProcAddress(g_ov.hD3dc, "D3DCompile");
     if (!*d3dCreate || !*factory2 || !*dcompCreate || !*d3dCompile) {
         Log("[ov] graphics proc resolve failed");
         return false;
     }
     return true;
+}
+
+// M12: a removed/reset device reports through these HRESULTs; any other failure
+// is a per-frame hiccup that must not trigger a full rebuild.
+bool IsDeviceLossHr(HRESULT hr) {
+    return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET;
 }
 
 // Flip model: buffer 0 always refers to the current back buffer, so one RTV
@@ -386,9 +552,10 @@ bool InitD3DAndComposition() {
 }
 
 bool InitPremulPipeline() {
-    HMODULE hd3dc = LoadLibraryW(L"d3dcompiler_47.dll");
-    if (!hd3dc) return false;
-    PFN_D3DCompile d3dCompile = (PFN_D3DCompile)GetProcAddress(hd3dc, "D3DCompile");
+    // M11: reuse the handle LoadGraphicsApis cached; loading d3dcompiler here
+    // again leaked a second reference on every (re)build.
+    if (!g_ov.hD3dc) return false;
+    PFN_D3DCompile d3dCompile = (PFN_D3DCompile)GetProcAddress(g_ov.hD3dc, "D3DCompile");
     if (!d3dCompile) return false;
 
     // Fullscreen triangle in the premultiply blend pass: out.rgb = dest.rgb * dest.a
@@ -441,34 +608,42 @@ bool InitImGui() {
     io.BackendPlatformName = "pbzfm_dc_overlay";
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-    bool fontOk = false;
-    // Malgun Gothic is the only candidate with Hangul, but its hanja coverage
-    // is too poor to serve Chinese, so it leads the list only for a Korean UI;
-    // everything else leads with YaHei (kana + CJK ideographs covered).
-    static const char* const kFontsDefault[] = {
-        "C:/Windows/Fonts/msyh.ttc",      // Microsoft YaHei (simplified Chinese UI font)
-        "C:/Windows/Fonts/msyhbd.ttc",
-        "C:/Windows/Fonts/malgun.ttf",    // Malgun Gothic (Korean)
-        "C:/Windows/Fonts/malgunbd.ttf",
-        "C:/Windows/Fonts/segoeui.ttf",
-    };
-    static const char* const kFontsKorean[] = {
-        "C:/Windows/Fonts/malgun.ttf",
-        "C:/Windows/Fonts/malgunbd.ttf",
-        "C:/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/segoeui.ttf",
-    };
+    // M5: the font used to be chosen once at startup, so switching to ko-KR at
+    // runtime kept YaHei and Hangul rendered as boxes. Load the primary font for
+    // the STARTUP language, then MERGE the other script's font into the same
+    // atlas: ImGui 1.92 loads glyphs on demand (RendererHasTextures), so a live
+    // language switch needs neither an atlas rebuild nor a new texture.
+    static const char* const kYahei = "C:/Windows/Fonts/msyh.ttc";
+    static const char* const kMalgun = "C:/Windows/Fonts/malgun.ttf";
+    static const char* const kFallback = "C:/Windows/Fonts/segoeui.ttf";
+    static const char* const kYaheiBold = "C:/Windows/Fonts/msyhbd.ttc";
+    static const char* const kMalgunBold = "C:/Windows/Fonts/malgunbd.ttf";
     const bool koreanUi = g_ov.cfg && g_ov.cfg->language == "ko-KR";
-    const char* const* fonts = koreanUi ? kFontsKorean : kFontsDefault;
-    const int fontCount = koreanUi ? 4 : 5;
-    for (int i = 0; i < fontCount; ++i) {
-        if (io.Fonts->AddFontFromFileTTF(fonts[i], 18.0f)) {
-            fontOk = true;
-            Log("[ov] font loaded: %s", fonts[i]);
-            break;
+    const char* primary = koreanUi ? kMalgun : kYahei;
+    const char* primaryBold = koreanUi ? kMalgunBold : kYaheiBold;
+    const char* other = koreanUi ? kYahei : kMalgun;   // merged for the other script
+    const char* base = nullptr;
+    if (io.Fonts->AddFontFromFileTTF(primary, 18.0f)) base = primary;
+    else if (io.Fonts->AddFontFromFileTTF(primaryBold, 18.0f)) base = primaryBold;
+    else if (io.Fonts->AddFontFromFileTTF(other, 18.0f)) base = other;
+    else if (io.Fonts->AddFontFromFileTTF(kFallback, 18.0f)) base = kFallback;
+    if (base) {
+        Log("[ov] font loaded: %s", base);
+        // Merge the complementary script (skip when the base already is that
+        // script, otherwise the atlas would hold the same font twice).
+        const char* mergeFont = nullptr;
+        if (strcmp(base, kYahei) == 0 || strcmp(base, kYaheiBold) == 0 ||
+            strcmp(base, kFallback) == 0) {
+            mergeFont = kMalgun;   // Hangul for a ko-KR switch
+        } else {
+            mergeFont = kYahei;    // kana/CJK ideographs for a zh-CN/ja-JP switch
         }
-    }
-    if (!fontOk) {
+        ImFontConfig merge;
+        merge.MergeMode = true;   // same atlas: every script is one texture
+        if (io.Fonts->AddFontFromFileTTF(mergeFont, 18.0f, &merge)) {
+            Log("[ov] font merged: %s (runtime language switch keeps glyphs)", mergeFont);
+        }
+    } else {
         io.Fonts->AddFontDefault();
         Log("[ov] WARNING: no system font found, falling back to ImGui default (CJK will show boxes)");
     }
@@ -486,8 +661,62 @@ bool InitImGui() {
     return true;
 }
 
+void SetVisible(bool v);   // defined below RenderFrame; used by device rebuild
+
+void ResetD3DObjects() {
+    g_ov.rtv.Reset();
+    g_ov.fsVs.Reset();
+    g_ov.fsPs.Reset();
+    g_ov.premulBs.Reset();
+    g_ov.rs.Reset();
+    g_ov.sc.Reset();
+    g_ov.dvisual.Reset();
+    g_ov.dtarget.Reset();
+    g_ov.ddev.Reset();
+    g_ov.ctx.Reset();
+    g_ov.dev.Reset();
+}
+
+// M12: recovery from DXGI_ERROR_DEVICE_REMOVED / DEVICE_RESET. Tears the ImGui
+// context + backend down with the dead device (so its textures die with it) and
+// rebuilds device, composition, pipeline and backend on the same render thread.
+// A failure leaves graphicsLost set: the menu stays inert rather than drawing
+// into dead objects or a null RTV.
+bool RebuildGraphics(const char* why) {
+    Log("[ov] %s - rebuilding the private device", why);
+    if (g_ov.visible) SetVisible(false);   // restores raw input/cursor and saves state
+    TexturesShutdown();
+    if (g_ov.imguiReady) {
+        ImGui_ImplDX11_Shutdown();
+        ImGui::DestroyContext();
+        g_ov.imguiReady = false;
+    }
+    ResetD3DObjects();
+    if (!InitD3DAndComposition()) return false;
+    if (!InitPremulPipeline()) return false;
+    if (!InitImGui()) return false;
+    QueryPerformanceCounter(&g_ov.qpcLast);   // no giant dt on the resumed frame
+    Log("[ov] device rebuilt");
+    return true;
+}
+
 void RenderFrame() {
-    if (!EnsureRtv()) return;  // retry next frame
+    if (g_ov.rebuildPending) {
+        g_ov.rebuildPending = false;
+        if (!RebuildGraphics("device removed/reset")) {
+            g_ov.graphicsLost = true;
+            Log("[ov] ERROR: device rebuild failed - overlay disabled until restart");
+            SetVisible(false);
+            return;
+        }
+    }
+    if (!g_ov.rtv && !EnsureRtv()) {
+        // M12: never render into a null RTV. A removed device queues a rebuild;
+        // any other failure just retries lazily on the next frame.
+        if (g_ov.dev && FAILED(g_ov.dev->GetDeviceRemovedReason()))
+            g_ov.rebuildPending = true;
+        return;
+    }
 
     ImGuiIO& io = ImGui::GetIO();
 
@@ -524,7 +753,22 @@ void RenderFrame() {
     while (InputPop(&ev)) {
         switch (ev.type) {
             case InputEvent::Key: io.AddKeyEvent((ImGuiKey)ev.key, ev.down); break;
-            case InputEvent::Btn: io.AddMouseButtonEvent(ev.key, ev.down); break;
+            case InputEvent::Btn:
+                // B3: never hand ImGui an index outside 0..ImGuiMouseButton_COUNT-1
+                // (AddMouseButtonEvent's assert is compiled out in Release and
+                // would write past MouseDown[5]). Any source - hooks, test
+                // injection, a future backend - is filtered here once.
+                if (ev.key < 0 || ev.key >= ImGuiMouseButton_COUNT) {
+                    static bool warned = false;
+                    if (!warned) {
+                        warned = true;
+                        Log("[ov] dropped out-of-range mouse button %d (valid 0..%d)", ev.key,
+                            ImGuiMouseButton_COUNT - 1);
+                    }
+                    break;
+                }
+                io.AddMouseButtonEvent(ev.key, ev.down);
+                break;
             case InputEvent::Wheel: io.AddMouseWheelEvent(ev.wx, ev.wy); break;
             case InputEvent::Move: {
                 POINT p{ (LONG)ev.wx, (LONG)ev.wy };
@@ -551,6 +795,16 @@ void RenderFrame() {
         // ImGui's idea of the keyboard is stale the moment isolation resumes
         // (modifier-downs fed before the chord, mouse buttons clicked there).
         io.ClearInputKeys();
+        // B3: the borrow window also lets XButton down/up reach the tool, so a
+        // side-button can be left "down" in ImGui (ClearInputKeys skips mouse
+        // keys). Clear the mouse state too; it invalidates MousePos, so reseed
+        // the position from the (frozen) real cursor to keep the menu cursor.
+        io.ClearInputMouse();
+        InputResetDropStats();   // L1: a reset is a new input session for the counters
+        POINT mp{};
+        GetCursorPos(&mp);
+        ScreenToClient(g_ov.hwnd, &mp);
+        io.AddMousePosEvent((float)mp.x, (float)mp.y);
     }
 
     if (now.QuadPart >= g_ov.diagNext.QuadPart) {
@@ -569,6 +823,9 @@ void RenderFrame() {
     // Key capture result -> dispatch by target (framework toggle or schema key).
     UINT captured = g_capturedVk.exchange(0, std::memory_order_acq_rel);
     if (captured) {
+        // H3: the result is written straight into a SchemaItem; hold the registry
+        // lock so ConfigAdd*/Get*/Set* from mod threads cannot race the write.
+        std::lock_guard<std::recursive_mutex> lock(RegistryMutex());
         int kind = g_captureKind.load(std::memory_order_relaxed);
         if (kind == CAP_SCHEMA_KEY) {
             ConfigDef* c = (ConfigDef*)g_capCfg;
@@ -596,6 +853,28 @@ void RenderFrame() {
             }
             g_capCfg = nullptr;
             g_capItem = nullptr;
+        } else if (kind == CAP_PASSTHROUGH) {
+            // Screenshot-tool passthrough chord captured in the settings page:
+            // replace the slot (or append), persist, and hand the new list to
+            // the hook immediately - no restart needed.
+            unsigned mods = g_capturedMods.load(std::memory_order_acquire) & 0xFu;
+            HotkeyChord c{};
+            c.vk = captured;
+            c.ctrl = (mods & 0x1u) != 0;
+            c.shift = (mods & 0x2u) != 0;
+            c.alt = (mods & 0x4u) != 0;
+            c.win = (mods & 0x8u) != 0;
+            auto& keys = g_ov.cfg->passthroughKeys;
+            int slot = g_captureIndex.load(std::memory_order_relaxed);
+            if (slot >= 0 && slot < (int)keys.size()) {
+                keys[slot] = c;
+            } else if ((int)keys.size() < 8) {
+                keys.push_back(c);
+            }
+            g_ov.cfg->Save(g_ov.iniPath);
+            InputSetPassthrough(keys, g_ov.cfg->passthroughReplay);
+            g_ov.ui.saveFlash = 2.0f;
+            Log("[ov] passthrough chord captured: %s (slot=%d)", Config::ChordToString(c).c_str(), slot);
         } else {
             g_ov.cfg->toggleVk = captured;
             g_toggleVk.store(captured, std::memory_order_relaxed);
@@ -655,11 +934,30 @@ void RenderFrame() {
 
     LARGE_INTEGER p0{}, p1{};
     QueryPerformanceCounter(&p0);
-    g_ov.sc->Present(1, 0);
-    g_ov.ddev->Commit();
+    HRESULT hrPresent = g_ov.sc->Present(1, 0);
+    HRESULT hrCommit = SUCCEEDED(hrPresent) ? g_ov.ddev->Commit() : hrPresent;
     QueryPerformanceCounter(&p1);
     float pms = (float)((double)(p1.QuadPart - p0.QuadPart) * 1000.0 / (double)g_ov.qpcFreq.QuadPart);
     if (pms > g_ov.presentMaxMs) g_ov.presentMaxMs = pms;
+    if (FAILED(hrPresent) || FAILED(hrCommit)) {
+        // M12: the old code discarded these HRESULTs and kept drawing on a dead
+        // device. A removed/reset device queues a rebuild; other failures are
+        // logged at most once a second so a transient hiccup cannot spam.
+        bool lost = IsDeviceLossHr(hrPresent) || IsDeviceLossHr(hrCommit) ||
+                    (g_ov.dev && FAILED(g_ov.dev->GetDeviceRemovedReason()));
+        if (lost) {
+            Log("[ov] device lost (present=0x%08lX commit=0x%08lX) - rebuild queued",
+                (unsigned long)hrPresent, (unsigned long)hrCommit);
+            g_ov.rebuildPending = true;
+        } else {
+            static LARGE_INTEGER lastLog{};
+            if (p1.QuadPart - lastLog.QuadPart >= g_ov.qpcFreq.QuadPart) {
+                lastLog = p1;
+                Log("[ov] WARNING: present/commit failed (present=0x%08lX commit=0x%08lX)",
+                    (unsigned long)hrPresent, (unsigned long)hrCommit);
+            }
+        }
+    }
 }
 
 void SetVisible(bool v) {
@@ -685,6 +983,11 @@ void SetVisible(bool v) {
         }
         g_ov.gw->UnclipCursor();
         StealGameRawMouse();
+        // L3: a new session must seed its cursor from the real GetCursorPos, not
+        // from Move events left unread when the previous session closed; L1
+        // counters are per session as well.
+        InputClearPendingMoves();
+        InputResetDropStats();
         g_ov.mousePosValid = false;
         // Seed the edge detector so the first frame after open does not count
         // as a "game regained foreground" transition.
@@ -698,10 +1001,28 @@ void SetVisible(bool v) {
         QueryPerformanceCounter(&g_ov.qpcLast);
         Log("[ov] menu open (hotkey, cursorHiddenByUs=%d)", (int)g_ov.cursorHiddenByUs);
     } else {
+        // H2: a pending key capture belongs to the open menu. Clear it on close
+        // so (a) the hook stops swallowing gameplay keys and (b) the stale
+        // (config,item) target cannot be written after the page is gone.
+        g_captureMode.store(0, std::memory_order_relaxed);
+        g_captureKind.store(CAP_NONE, std::memory_order_relaxed);
+        g_captureIndex.store(-1, std::memory_order_relaxed);
+        g_capturedVk.store(0, std::memory_order_release);
+        g_capturedMods.store(0, std::memory_order_release);
+        g_capCfg = nullptr;
+        g_capItem = nullptr;
+
         ShowWindow(g_ov.hwnd, SW_HIDE);
         RestoreGameRawMouse();
         ImGui::GetIO().MouseDrawCursor = false;
         ShowCursor(TRUE);   // our queue: back to 0 (visible), exact undo of the open drain
+        // L2: a key/button held while the menu is toggled off never produces a
+        // queue event (the hook passes it to the game once closed), so ImGui
+        // would keep it "down" until the next reset. Clear both here so a
+        // reopen never starts with phantom held input.
+        ImGui::GetIO().ClearInputKeys();
+        ImGui::GetIO().ClearInputMouse();
+        InputResetDropStats();
         if (g_ov.cursorHiddenByUs) {
             g_ov.gw->ShowCursor(true);   // force back to the pre-menu visible state
             g_ov.cursorHiddenByUs = false;
@@ -727,21 +1048,43 @@ void CleanupGraphics() {
         ImGui::DestroyContext();
         g_ov.imguiReady = false;
     }
-    g_ov.rtv.Reset();
-    g_ov.fsVs.Reset();
-    g_ov.fsPs.Reset();
-    g_ov.premulBs.Reset();
-    g_ov.rs.Reset();
-    g_ov.sc.Reset();
-    g_ov.dvisual.Reset();
-    g_ov.dtarget.Reset();
-    g_ov.ddev.Reset();
-    g_ov.ctx.Reset();
-    g_ov.dev.Reset();
+    ResetD3DObjects();
+    // M11: release the graphics DLL references exactly once, on the way down.
+    auto release = [](HMODULE& h) {
+        if (h) {
+            FreeLibrary(h);
+            h = nullptr;
+        }
+    };
+    release(g_ov.hD3d11);
+    release(g_ov.hDxgi);
+    release(g_ov.hDcomp);
+    release(g_ov.hD3dc);
     if (g_ov.hwnd) {
         DestroyWindow(g_ov.hwnd);
         g_ov.hwnd = nullptr;
     }
+}
+
+// H7: called only once the overlay window is destroyed (CleanupGraphics on the
+// render thread) and the game WndProc restore has run (OverlayStop). Never while
+// a window still uses the class - Windows refuses that, and the class must not
+// linger after the DLL unloads.
+void UnregisterOverlayWindowClass() {
+    if (!g_ov.classRegistered) return;
+    if (g_ov.hwnd) {
+        Log("[ov] overlay window still alive - window class left registered");
+        return;
+    }
+    if (!UnregisterClassW(g_ov.className.c_str(), g_ov.classInstance)) {
+        Log("[ov] WARNING: UnregisterClassW failed err=%lu (class=%ls)", GetLastError(),
+            g_ov.className.c_str());
+    } else {
+        Log("[ov] overlay window class unregistered");
+    }
+    g_ov.classRegistered = false;
+    g_ov.classInstance = nullptr;
+    g_ov.className.clear();
 }
 
 DWORD WINAPI RenderThread(LPVOID) {
@@ -757,6 +1100,20 @@ DWORD WINAPI RenderThread(LPVOID) {
     bool gameValid = true;
     int findTick = 0;
     while (g_running.load(std::memory_order_relaxed)) {
+        // H6: mod hotkey callbacks are queued by the keyboard hook and executed
+        // here on the render thread (menu open or closed), never inside the LL
+        // hook where a slow callback would stall all game input.
+        RegistryFlushQueuedHotkeys();
+
+        if (g_ov.graphicsLost) {
+            // M12: degraded mode - the menu cannot render, so swallow toggle
+            // requests while gameplay hotkeys (above) and shutdown stay clean.
+            g_wantToggle.store(false, std::memory_order_relaxed);
+            g_closeRequest.store(false, std::memory_order_relaxed);
+            Sleep(100);
+            continue;
+        }
+
         if (g_wantToggle.exchange(false, std::memory_order_acq_rel)) SetVisible(!g_ov.visible);
         if (g_closeRequest.exchange(false, std::memory_order_acq_rel)) SetVisible(false);
 
@@ -830,17 +1187,40 @@ bool OverlayStart(GameWindow* gw, Config* cfg, I18n* i18n, const std::wstring& i
             return false;
         }
     }
-    return true;
+    // M12: a 20 s no-window timeout is an init FAILURE - the old "return true"
+    // let the caller believe the overlay was usable while the render thread was
+    // still stuck. OverlayStop() by the caller then applies the B2/H9 rollback
+    // and pins the module if the thread cannot be joined.
+    Log("[ov] ERROR: overlay init timed out after 20s (no window)");
+    return false;
 }
 
-void OverlayStop() {
+bool OverlayStop() {
     if (g_ov.thread) {
         if (WaitForSingleObject(g_ov.thread, 5000) != WAIT_OBJECT_0) {
-            Log("[ov] WARNING: render thread did not exit within 5s");
+            // B2/H9: do not continue with the restore while the render thread
+            // may still be using the game window/overlay state. Keep the handle
+            // (and the subclass) and report the failure instead of pretending
+            // we unloaded cleanly - the caller pins the module on false.
+            Log("[ov] ERROR: render thread still running after 5s - skipping WndProc restore");
+            return false;
         }
         CloseHandle(g_ov.thread);
         g_ov.thread = nullptr;
     }
+    // B2: the render thread is confirmed gone, so the game window can no
+    // longer be re-found/re-subclassed underneath us; undo the subclass now.
+    bool ok = true;
+    if (g_ov.gw && !g_ov.gw->Detach()) {
+        Log("[ov] ERROR: game window subclass restore failed");
+        ok = false;
+    }
+    // H7: the overlay window is already destroyed (CleanupGraphics ran on the
+    // render thread before it exited) and the game WndProc restore has been
+    // attempted; only now is it safe to drop the class atom. Doing this before
+    // the join could unregister a class a live window still uses.
+    UnregisterOverlayWindowClass();
+    return ok;
 }
 
 } // namespace pbzfm

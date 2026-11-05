@@ -23,7 +23,10 @@ namespace pbzfm {
 // one - the menu cursor freezes while the camera keeps tracking. Re-hooking
 // on menu open jumps our hooks back to the front of the chain.
 bool InputStart();   // spawns the hook thread (returns immediately)
-void InputStop();
+// H9: unhooks first, then posts WM_QUIT and waits up to 3 s. Returns false when
+// the hook thread could not be joined - the caller must then treat the module
+// as unsafe to unload (see RequestShutdown in pbzfm.cpp).
+bool InputStop();
 void InputRehook();  // unhook + rehook on the hook thread (front of chain)
 
 struct InputEvent {
@@ -35,6 +38,11 @@ struct InputEvent {
 };
 
 bool InputPop(InputEvent* out);   // render thread consumes the queue
+// L1: session-scoped drop counters (queue-full evictions); reset on open/close.
+void InputResetDropStats();
+// L3: drop unread Move events at a session boundary so a reopen never seeds the
+// cursor from a previous session's queue tail.
+void InputClearPendingMoves();
 
 // Screenshot-tool passthrough. While the menu owns the input, the configured
 // chords (PixPin's Alt+P, the NVIDIA App capture key, ...) open a borrow
