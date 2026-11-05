@@ -19,3 +19,6 @@ data/
 Python/
 %SystemDrive%/
 nul
+
+# clean release build (A/B package)
+build_release/
