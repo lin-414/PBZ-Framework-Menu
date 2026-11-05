@@ -70,3 +70,5 @@
 | 窗口消息输入通道（引擎模式无全局钩子）：键盘/呼出键/键位捕获走游戏 WndProc，鼠标走覆盖窗 | ✅ 2026-11-05 两套构建 + ctest；实机行为待验证 |
 | 冻结重新施加：WM_ACTIVATE/WM_SETFOCUS 立即补 + 200ms 读回校验（修 N 卡浮层抢焦点后左键漏给 PhotoMode） | ✅ 2026-11-05 两套构建 + host 回归；实机待复核 |
 | 引擎模式也做进程级 Raw Input 改指向（鼠标+键盘），挡住绕过 PlayerController 的输入 | ✅ 2026-11-05 host 回归（steal/restore 全链路，sinks removed 正常） |
+| Raw Input 归属判定改用 hwndTarget（修 4Hz 重抢导致还原表丢游戏鼠标、关菜单后相机死） | ✅ 2026-11-05 三套构建 + host 回归 |
+| 覆盖窗 WDA_EXCLUDEFROMCAPTURE（N 卡不再把菜单当录制目标，关菜单不再结束录制） | ✅ 2026-11-05 host 日志可见；实机待复核 |

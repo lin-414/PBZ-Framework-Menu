@@ -204,16 +204,16 @@ bool StealGameRawInput() {
     }
     saved.resize(got);
 
-    // H1 的键盘版：绝不允许把我们自己的 sink 写进还原表。鼠标被游戏重注册、
-    // 而我们上一轮的键盘 sink 还活着时，天真的"存下来"会让关闭时把我们的 sink
-    // 再注册回去（游戏键盘从此失效）。这里先把自己名下的条目录掉再保存。
-    const size_t before = saved.size();
-    saved.erase(std::remove_if(saved.begin(), saved.end(),
-                   [](const RAWINPUTDEVICE& d) { return d.hwndTarget == g_ov.hwnd; }),
-                saved.end());
-    if (saved.size() != before) {
-        Log("[ov] raw input: dropped %u of our own sink entries before saving the restore list",
-            (unsigned)(before - saved.size()));
+    // H1（加强版）：只要实时列表里还有**任何一条**指向本覆盖窗的条目，就说明我们
+    // 上一轮的 sink 还活着（焦点来回/游戏只重注册了部分设备时很常见）。
+    // 此时绝不能拿它当"游戏的原始注册表"存下来 —— 那会把游戏自己的 mouse/keyboard
+    // 条目永久弄丢（2026-11-05 22:15 实机：还原表被写成 only-ours，关菜单后相机死）。
+    // 正确做法：认为已经处于"已接管"状态，保留原有还原表，什么都不改。
+    if (std::any_of(saved.begin(), saved.end(),
+                    [](const RAWINPUTDEVICE& d) { return d.hwndTarget == g_ov.hwnd; })) {
+        Log("[ov] raw input: our sink is still live (%u entries) - keeping the saved restore list",
+            (unsigned)saved.size());
+        return true;
     }
 
     RAWINPUTDEVICE ours{};
@@ -238,7 +238,11 @@ bool StealGameRawInput() {
         }
     }
     if (!hadMouse) next.push_back(ours);
-    if (!hadKeyboard) next.push_back(oursKb);
+    // 键盘只在游戏本来就注册了的时候才顶替：本作实测 raw keyboard 根本没注册
+    // （日志 keyboard=0），硬加一个 sink 只会扩大副作用面，挡不到任何真实输入。
+    if (!hadKeyboard) {
+        // 什么都不加，保持进程注册表原样
+    }
 
     if (!RegisterRawInputDevices(next.data(), (UINT)next.size(), sizeof(RAWINPUTDEVICE))) {
         // H1: a failed steal leaves the process-wide registration exactly as it
@@ -331,9 +335,13 @@ bool RawMouseIsOurs() {
     std::vector<RAWINPUTDEVICE> list(n);
     UINT got = n;
     if (n > 0 && !GetRegisteredRawInputDevices(list.data(), &got, sizeof(RAWINPUTDEVICE))) return false;
+    // 判据只能用 hwndTarget：实机 2026-11-05 22:15 证明 GetRegisteredRawInputDevices
+    // 回报的 dwFlags 并不总是带 RIDEV_INPUTSINK（我们注册了 sink，但查询结果里读不到），
+    // 于是"指针归属"被判成 false → 4Hz 看门狗反复重抢 → 还原表被写成 only-ours
+    // → 关菜单后游戏的鼠标注册表永久丢失。hwndTarget 是唯一可靠的归属证据。
     for (const RAWINPUTDEVICE& d : list) {
         if (d.usUsagePage == 0x01 && d.usUsage == 0x02)
-            return d.hwndTarget == g_ov.hwnd && (d.dwFlags & RIDEV_INPUTSINK) != 0;
+            return d.hwndTarget == g_ov.hwnd;
     }
     return false;   // no mouse entry at all - ours is gone, steal again
 }
@@ -377,6 +385,9 @@ static void CaptureGameScreen() {
 
     std::vector<unsigned char> png;
     bool ok = false;
+    // 覆盖窗平时被排除出采集（见 CreateOverlayWindow），但框架自己的截图要
+    // "含菜单界面本身"，所以这里临时放开，拍完立刻恢复。
+    const bool hadExclusion = g_ov.hwnd && SetWindowDisplayAffinity(g_ov.hwnd, WDA_NONE) != 0;
     HDC screen = GetDC(nullptr);
     if (screen) {
         HDC mem = CreateCompatibleDC(screen);
@@ -399,6 +410,7 @@ static void CaptureGameScreen() {
         DeleteDC(mem);
         ReleaseDC(nullptr, screen);
     }
+    if (hadExclusion) SetWindowDisplayAffinity(g_ov.hwnd, WDA_EXCLUDEFROMCAPTURE);
     if (!ok) {
         Log("[ov] screenshot FAILED (%dx%d)", gw->w, gw->h);
         return;
@@ -478,6 +490,18 @@ bool CreateOverlayWindow() {
         return false;
     }
     Log("[ov] overlay window created (%dx%d at %d,%d, class=%ls)", g_ov.w, g_ov.h, g_ov.gw->x, g_ov.gw->y, cls);
+
+    // 把覆盖窗排除出所有采集 API。实机 2026-11-05：N 卡把我们的顶层覆盖窗当成
+    // "正在被录制的窗口"，于是按 F8 让菜单消失时它会自动结束录制。排除之后录制目标
+    // 只剩游戏本身，菜单显隐不再影响录制。Win10 2004+ 才支持，失败只记一行。
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
+    if (SetWindowDisplayAffinity(g_ov.hwnd, WDA_EXCLUDEFROMCAPTURE))
+        Log("[ov] overlay excluded from capture (WDA_EXCLUDEFROMCAPTURE)");
+    else
+        Log("[ov] WARNING: SetWindowDisplayAffinity failed err=%lu - the menu will show up in recordings",
+            GetLastError());
     return true;
 }
 
