@@ -3,6 +3,7 @@
 // window work under the loader lock (PBZPhotoMode lesson 1.1.0).
 #include "common.h"
 #include "config.h"
+#include "engine_port.h"
 #include "i18n.h"
 #include "game_window.h"
 #include "input.h"
@@ -139,6 +140,12 @@ DWORD WINAPI InitThreadProc(LPVOID) {
     InputSetPassthrough(g_cfg.passthroughKeys, g_cfg.passthroughReplay);
     g_i18n.Load(ModRoot() + L"\\languages", Utf8ToWide(g_cfg.language));
 
+    // 方案 C：先问引擎端口。可用时输入全部走引擎（APlayerController 冻结 +
+    // 引擎侧取鼠标/按键），模块既不装全局 LL 钩子也不改 Raw Input —— 系统的
+    // 录屏/截图/游戏栏热键因此完全不受影响。不可用（host 测试、没装 UE4SS、
+    // 或本构建没编引擎后端）则回退到旧路径，行为与 0.5.x 一致。
+    const bool engineInput = EnginePortInit(InputModeFromString(g_cfg.inputMode.c_str()));
+
     if (!OverlayStart(&g_gw, &g_cfg, &g_i18n, iniPath)) {
         Log("overlay failed to start - module dormant (see earlier log lines)");
         // B2: a failed init must not leave the game window subclassed for the
@@ -148,9 +155,15 @@ DWORD WINAPI InitThreadProc(LPVOID) {
             g_unloadUnsafe.store(true, std::memory_order_relaxed);
             Log("ERROR: subclass rollback after init failure failed");
         }
+        EnginePortShutdown();   // 引擎后端可能已经挂了 tick 钩子，失败路径也要撤
         return 0;
     }
-    InputStart();
+    if (!engineInput) {
+        InputStart();
+        Log("[input] backend: os (global LL hooks + raw-input re-point)");
+    } else {
+        Log("[input] backend: engine - global hooks are off, system hotkeys/recording unaffected");
+    }
     Log("prototype ready: press %s to toggle the menu", Config::VkName(g_cfg.toggleVk));
 
     while (g_running.load(std::memory_order_relaxed)) Sleep(200);
@@ -161,6 +174,7 @@ DWORD WINAPI InitThreadProc(LPVOID) {
     // marked unsafe to unload instead of pretending the shutdown was clean.
     const bool inputOk = InputStop();
     const bool overlayOk = OverlayStop();
+    EnginePortShutdown();
     if (inputOk && overlayOk) {
         Log("PBZFM unloaded cleanly");
     } else {

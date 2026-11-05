@@ -16,6 +16,10 @@ struct Config {
     // framework
     std::string language = "zh-CN";   // UTF-8, matches i18n/ImGui
     UINT toggleVk = VK_F8;
+    // 方案 C：输入后端。"auto" = 有引擎端口就用引擎，否则 OS 钩子（默认）；
+    // "engine" = 强制引擎（不可用则告警回退）；"os" = 强制旧的全局钩子路径。
+    // 引擎模式不装 LL 钩子、不改 Raw Input，系统的录屏/截图热键因此不受影响。
+    std::string inputMode = "auto";
     // Chords handed to global screenshot tools (PixPin / NVIDIA App) instead
     // of being swallowed while the menu owns the input. Empty = feature off.
     std::vector<HotkeyChord> passthroughKeys = {

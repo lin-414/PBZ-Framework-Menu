@@ -40,6 +40,12 @@ Raw Input 改指向，菜单期间镜头冻结、关闭即恢复。为什么是�
 （LL 钩子链插队、Raw Input 注册归属、ClipCursor/ShowCursor 禁区、截图直通两条路），
 见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
+**方案 C（进行中，`feat/engine-input`）**：把「冻结游戏」从全局钩子换成引擎内冻结
+（`bBlockInput` / `SetIgnore*Input`），模块不再安装任何 `WH_*_LL` 钩子、不再改 Raw Input，
+因此录屏 / 截图 / 游戏栏的全局热键在菜单打开时照常有效。设计边界、构建方式与实机
+验证清单见 [docs/ENGINE_INPUT_PLAN.md](docs/ENGINE_INPUT_PLAN.md)。默认构建仍是零依赖
+的 OS 钩子版；引擎版用 `build_engine.bat` 单独出包。
+
 ## 构建
 
 需要 VS 2022 BuildTools（C++ 工具集 + 自带 CMake/Ninja）。不依赖 RE-UE4SS 源码、

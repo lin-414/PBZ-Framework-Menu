@@ -8,6 +8,7 @@
 
 #include "common.h"
 #include "config.h"
+#include "engine_port.h"
 #include "i18n.h"
 #include "game_window.h"
 #include "input.h"
@@ -735,7 +736,7 @@ void RenderFrame() {
     // ahead of us in the LL chain. The 4 Hz poll covers re-registrations
     // without an activation edge (Steam Input does this at any time).
     bool gameFg = g_ov.gw->hwnd && GetForegroundWindow() == g_ov.gw->hwnd;
-    if (gameFg && !g_ov.gameWasFg) {
+    if (gameFg && !g_ov.gameWasFg && !EnginePortActive()) {
         InputRehook();
         g_ov.gw->UnclipCursor();
         bool restolen = !RawMouseIsOurs();
@@ -743,7 +744,7 @@ void RenderFrame() {
         Log("[ov] game regained foreground - rehook + unclip%s", restolen ? " + raw re-steal" : "");
     }
     g_ov.gameWasFg = gameFg;
-    if (now.QuadPart >= g_ov.rawWatchNext.QuadPart) {
+    if (!EnginePortActive() && now.QuadPart >= g_ov.rawWatchNext.QuadPart) {
         g_ov.rawWatchNext.QuadPart = now.QuadPart + g_ov.qpcFreq.QuadPart / 4;
         if (!RawMouseIsOurs()) StealGameRawMouse();
     }
@@ -970,19 +971,34 @@ void SetVisible(bool v) {
         }
         SetWindowPos(g_ov.hwnd, HWND_TOPMOST, g_ov.gw->x, g_ov.gw->y, g_ov.gw->w, g_ov.gw->h, SWP_NOACTIVATE);
         ShowWindow(g_ov.hwnd, SW_SHOWNA);
-        // The input hook freezes the real cursor and ImGui draws its own
-        // (MouseDrawCursor), so the real one is hidden while the menu is open.
-        // Only hide it when it was visible; a hidden (gameplay) cursor is left
-        // untouched so closing our menu cannot break the game's cursor state.
-        CURSORINFO ci{ sizeof(CURSORINFO) };
-        if (GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING)) {
-            g_ov.gw->ShowCursor(false);
-            g_ov.cursorHiddenByUs = true;
-        } else {
+        if (EnginePortActive()) {
+            // 方案 C：引擎后端负责冻结 look/move 和显示光标（真正的引擎调用
+            // 在游戏线程执行）。这里绝不碰 Raw Input、不动 ShowCursor 计数、
+            // 不解除游戏的 ClipCursor —— 系统输入流保持原样，录屏/截图热键不受影响。
+            EnginePortSetMenuOpen(true);
             g_ov.cursorHiddenByUs = false;
+            ImGui::GetIO().MouseDrawCursor = false;   // 系统光标由引擎显示，不画第二个
+        } else {
+            // The input hook freezes the real cursor and ImGui draws its own
+            // (MouseDrawCursor), so the real one is hidden while the menu is open.
+            // Only hide it when it was visible; a hidden (gameplay) cursor is left
+            // untouched so closing our menu cannot break the game's cursor state.
+            CURSORINFO ci{ sizeof(CURSORINFO) };
+            if (GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING)) {
+                g_ov.gw->ShowCursor(false);
+                g_ov.cursorHiddenByUs = true;
+            } else {
+                g_ov.cursorHiddenByUs = false;
+            }
+            g_ov.gw->UnclipCursor();
+            StealGameRawMouse();
+            // The cursor sits over OUR overlay window, so its visibility follows
+            // THIS thread's ShowCursor count - hiding it here never touches the
+            // game's own bookkeeping (the game-thread drain wedged the game's
+            // input state). ImGui draws the only cursor.
+            ImGui::GetIO().MouseDrawCursor = true;
+            while (ShowCursor(FALSE) >= 0) {}
         }
-        g_ov.gw->UnclipCursor();
-        StealGameRawMouse();
         // L3: a new session must seed its cursor from the real GetCursorPos, not
         // from Move events left unread when the previous session closed; L1
         // counters are per session as well.
@@ -992,12 +1008,6 @@ void SetVisible(bool v) {
         // Seed the edge detector so the first frame after open does not count
         // as a "game regained foreground" transition.
         g_ov.gameWasFg = g_ov.gw->hwnd && GetForegroundWindow() == g_ov.gw->hwnd;
-        ImGui::GetIO().MouseDrawCursor = true;
-        // The cursor sits over OUR overlay window, so its visibility follows
-        // THIS thread's ShowCursor count - hiding it here never touches the
-        // game's own bookkeeping (the game-thread drain wedged the game's
-        // input state). ImGui draws the only cursor.
-        while (ShowCursor(FALSE) >= 0) {}
         QueryPerformanceCounter(&g_ov.qpcLast);
         Log("[ov] menu open (hotkey, cursorHiddenByUs=%d)", (int)g_ov.cursorHiddenByUs);
     } else {
@@ -1013,9 +1023,15 @@ void SetVisible(bool v) {
         g_capItem = nullptr;
 
         ShowWindow(g_ov.hwnd, SW_HIDE);
-        RestoreGameRawMouse();
         ImGui::GetIO().MouseDrawCursor = false;
-        ShowCursor(TRUE);   // our queue: back to 0 (visible), exact undo of the open drain
+        if (EnginePortActive()) {
+            // 方案 C：由引擎线程解冻并恢复光标，这里不做任何 OS 级恢复动作。
+            EnginePortSetMenuOpen(false);
+            g_ov.cursorHiddenByUs = false;
+        } else {
+            RestoreGameRawMouse();
+            ShowCursor(TRUE);   // our queue: back to 0 (visible), exact undo of the open drain
+        }
         // L2: a key/button held while the menu is toggled off never produces a
         // queue event (the hook passes it to the game once closed), so ImGui
         // would keep it "down" until the next reset. Clear both here so a
@@ -1023,7 +1039,7 @@ void SetVisible(bool v) {
         ImGui::GetIO().ClearInputKeys();
         ImGui::GetIO().ClearInputMouse();
         InputResetDropStats();
-        if (g_ov.cursorHiddenByUs) {
+        if (!EnginePortActive() && g_ov.cursorHiddenByUs) {
             g_ov.gw->ShowCursor(true);   // force back to the pre-menu visible state
             g_ov.cursorHiddenByUs = false;
             // The posted restore runs on the game window thread; verify the
@@ -1038,7 +1054,7 @@ void SetVisible(bool v) {
     }
     g_menuOpen.store(v, std::memory_order_release);
     RegistryDispatchMenuEvent(v);   // v2 menu open/close listeners (render thread)
-    if (v) InputRehook();   // jump our hooks to the LL chain front (see input.h)
+    if (v && !EnginePortActive()) InputRehook();   // jump our hooks to the LL chain front (see input.h)
 }
 
 void CleanupGraphics() {

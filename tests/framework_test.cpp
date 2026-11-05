@@ -9,6 +9,7 @@
 
 #include "common.h"
 #include "config.h"
+#include "engine_port.h"
 #include "input.h"
 #include "pbzfm.h"
 #include "registry.h"
@@ -443,6 +444,72 @@ void TestInputQueueEviction() {
     InputResetDropStats();
 }
 
+// 方案 C：后端策略是纯判定，必须在单测里锁死——它决定「装不装全局钩子」，
+// 判错一次就会把系统输入流重新污染回去。
+void TestInputBackendPolicy() {
+    using namespace pbzfm;
+
+    CHECK(InputModeFromString(nullptr) == InputMode::Auto);
+    CHECK(InputModeFromString("") == InputMode::Auto);
+    CHECK(InputModeFromString("auto") == InputMode::Auto);
+    CHECK(InputModeFromString("AUTO") == InputMode::Auto);
+    CHECK(InputModeFromString("engine") == InputMode::Engine);
+    CHECK(InputModeFromString("ue4ss") == InputMode::Engine);
+    CHECK(InputModeFromString("os") == InputMode::Os);
+    CHECK(InputModeFromString("hook") == InputMode::Os);
+    CHECK(InputModeFromString("garbage") == InputMode::Auto);   // 未知值不能静默变成 os
+
+    CHECK(std::string(InputModeName(InputMode::Auto)) == "auto");
+    CHECK(std::string(InputModeName(InputMode::Engine)) == "engine");
+    CHECK(std::string(InputModeName(InputMode::Os)) == "os");
+
+    // auto：引擎就绪才用引擎；显式 os 永远走钩子；显式 engine 不就绪时回退 os。
+    CHECK(ResolveInputBackend(InputMode::Auto, true) == InputBackend::Engine);
+    CHECK(ResolveInputBackend(InputMode::Auto, false) == InputBackend::Os);
+    CHECK(ResolveInputBackend(InputMode::Engine, true) == InputBackend::Engine);
+    CHECK(ResolveInputBackend(InputMode::Engine, false) == InputBackend::Os);
+    CHECK(ResolveInputBackend(InputMode::Os, true) == InputBackend::Os);
+    CHECK(ResolveInputBackend(InputMode::Os, false) == InputBackend::Os);
+
+    // 本测试构建没有引擎后端（PBZFM_ENGINE_PORT=OFF）：auto/os 必须落回 OS 钩子。
+    CHECK(!EnginePortActive());
+    CHECK(!EnginePortInit(InputMode::Auto));
+    CHECK(!EnginePortActive());
+    CHECK(!EnginePortInit(InputMode::Engine));   // 显式 engine 也不许假装成功
+    CHECK(!EnginePortActive());
+    CHECK(EnginePortUnavailableReason() != nullptr && EnginePortUnavailableReason()[0] != 0);
+    EnginePortShutdown();
+    CHECK(!EnginePortActive());
+    // 未激活时转发是空操作，不能崩。
+    EnginePortSetMenuOpen(true);
+    EnginePortSetMenuOpen(false);
+}
+
+// input_mode 必须能从 ini 读回、并被写回（否则玩家改不了后端）。
+void TestInputModeConfig() {
+    const std::wstring path = pbzfm::RootFile(L"data/input_mode_test.ini");
+    DeleteFileW(path.c_str());
+
+    pbzfm::Config def;
+    CHECK(def.inputMode == "auto");
+    CHECK(def.Save(path));
+    {
+        pbzfm::Config back;
+        CHECK(back.Load(path));
+        CHECK(back.inputMode == "auto");
+    }
+
+    // 磁盘上写成 engine 后必须读回 engine。
+    const std::string text = "; cfg\n\n[framework]\ninput_mode = engine\ntoggle_key = F8\n";
+    CHECK(pbzfm::WriteFileAtomic(path, text));
+    {
+        pbzfm::Config back;
+        CHECK(back.Load(path));
+        CHECK(back.inputMode == "engine");
+    }
+    DeleteFileW(path.c_str());
+}
+
 void Run(const char* name, void (*fn)()) {
     const int before = g_failures;
     fn();
@@ -464,6 +531,8 @@ int main() {
     Run("M2 schema key escaping", TestSchemaKeyEscaping);
     Run("key combo codec", TestKeyCodec);
     Run("L1 input queue eviction", TestInputQueueEviction);
+    Run("C input backend policy", TestInputBackendPolicy);
+    Run("C input_mode config", TestInputModeConfig);
 
     // Leave the TLS current section outside the subtrees we delete (deleting a
     // node that is still "current" would leave a dangling thread-local pointer).

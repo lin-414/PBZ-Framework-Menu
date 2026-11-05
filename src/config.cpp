@@ -68,6 +68,7 @@ bool Config::Load(const std::wstring& path) {
         if (section == L"framework") {
             if (k == "language") language = WideToUtf8(val);
             else if (k == "toggle_key") { UINT vk = VkFromName(val); if (vk) toggleVk = vk; }
+            else if (k == "input_mode") inputMode = WideToUtf8(val);
             else if (k == "passthrough_keys") passthroughKeys = ChordsFromText(val);
             else if (k == "passthrough_replay") passthroughReplay = (val == L"1" || _wcsicmp(val.c_str(), L"true") == 0);
         } else if (section == L"ui") {
@@ -93,6 +94,10 @@ bool Config::Save(const std::wstring& path) const {
     out += "; PBZ Menu Framework prototype config\n";
     out += "\n[framework]\n";
     out += "language = " + language + "\n";
+    // 方案 C：把输入后端写回 ini，并留一段注释让玩家知道这个开关存在。
+    out += "; input_mode: auto = 能用引擎输入就用引擎（不装全局钩子, 录屏/截图热键不受影响）\n";
+    out += ";            engine = 强制引擎模式(不可用会回退并记日志); os = 旧路径(全局钩子 + Raw Input 改指向)\n";
+    out += "input_mode = " + (inputMode.empty() ? std::string("auto") : inputMode) + "\n";
     snprintf(buf, sizeof(buf), "toggle_key = %s\n", VkName(toggleVk));
     out += buf;
     std::string chords;
