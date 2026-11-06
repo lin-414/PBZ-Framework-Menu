@@ -85,7 +85,7 @@ bool Config::Load(const std::wstring& path) {
             else if (k == "demo_clicks") clicks = wcstol(val.c_str(), nullptr, 10);
         }
     }
-    uiScale = std::clamp(uiScale, 0.7f, 1.8f);
+    uiScale = std::clamp(uiScale, kUiScaleMin, kUiScaleMax);
     uiOpacity = std::clamp(uiOpacity, 0.4f, 1.0f);
     quality = std::clamp(quality, 0, 3);
     return true;

@@ -37,7 +37,7 @@ std::atomic<void*> g_gameHwnd{ nullptr };
 std::atomic<int>  g_inputReset{ 0 };
 
 #ifndef PBZFM_VERSION_STR
-#define PBZFM_VERSION_STR "0.5.0"
+#define PBZFM_VERSION_STR "0.6.0"
 #endif
 const char* const kVersion = PBZFM_VERSION_STR;
 

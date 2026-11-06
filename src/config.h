@@ -5,6 +5,13 @@
 
 namespace pbzfm {
 
+// UI scale bounds shared by the config parser and the menu slider. The
+// effective scale applies to the font AND every layout metric (see
+// theme::ApplyUiScale), so it behaves like a DPI zoom rather than a font-size
+// knob that clips fixed-width columns.
+inline constexpr float kUiScaleMin = 0.7f;
+inline constexpr float kUiScaleMax = 1.8f;
+
 // A hotkey chord as written in PBZFM.ini ("Alt+P", "Ctrl+Shift+F5"). Modifiers
 // must match exactly (a held extra Shift does not trigger an Alt+P chord).
 struct HotkeyChord {
@@ -28,7 +35,7 @@ struct Config {
     // the injected events flow back through our own borrow window untouched.
     bool passthroughReplay = true;
     // ui
-    float uiScale   = 1.0f;   // style.FontScaleMain
+    float uiScale   = 1.0f;   // effective UI scale: font + layout metrics (style base is unscaled)
     float uiOpacity = 0.94f;  // menu window background alpha
     // Theme selector: "ink" = built-in 玄墨鎏金, else themes\<name>.json stem.
     std::string theme = "ink";

@@ -16,6 +16,17 @@ namespace {
 
 float s_lastWindowOpacity = 0.94f;
 
+// Unscaled style snapshot: ApplyPbzTheme + theme-file overrides at scale 1.0.
+// ApplyUiScale() always starts from this snapshot instead of scaling the live
+// style, which otherwise compounds every frame and rounds the metrics away.
+ImGuiStyle s_baseStyle;
+bool s_baseStyleValid = false;
+
+void CaptureBaseStyle() {
+    s_baseStyle = ImGui::GetStyle();
+    s_baseStyleValid = true;
+}
+
 std::wstring Utf8ToWide(const std::string& u) {
     if (u.empty()) return {};
     int n = MultiByteToWideChar(CP_UTF8, 0, u.c_str(), (int)u.size(), nullptr, 0);
@@ -142,6 +153,7 @@ void ApplyPbzTheme(float windowOpacity) {
     s.SeparatorTextAlign = ImVec2(0.0f, 0.5f);
 
     s.FontScaleMain = 1.0f;
+    s._MainScale = 1.0f;   // fresh baseline for the next ScaleAllSizes()
 
     ImVec4* c = s.Colors;
     c[ImGuiCol_Text]                      = kRice;
@@ -204,16 +216,35 @@ void ApplyPbzTheme(float windowOpacity) {
     c[ImGuiCol_ModalWindowDimBg]          = WithAlpha(kInk, 0.70f);
 }
 
+void ApplyUiScale(float uiScale) {
+    if (uiScale < 0.1f) uiScale = 1.0f;
+    if (!s_baseStyleValid) {
+        // First call before ApplyThemeByName() finished (defensive): current
+        // style is the unscaled built-in baseline.
+        CaptureBaseStyle();
+    }
+    ImGuiStyle scaled = s_baseStyle;
+    scaled.ScaleAllSizes(uiScale);   // all spacing/padding/thickness values
+    scaled.FontScaleMain = uiScale;  // ... and the glyphs themselves
+    ImGui::GetStyle() = scaled;
+}
+
 void ApplyThemeByName(const std::string& nameUtf8) {
-    // Always re-base on the built-in style first: switching between theme
-    // files (or back to "ink") must not inherit the previous file's leftovers.
+    // Always re-base on the unscaled built-in style first: switching between
+    // theme files (or back to "ink") must not inherit the previous file's
+    // leftovers, and must not capture a scaled style as the new baseline.
+    if (s_baseStyleValid) ImGui::GetStyle() = s_baseStyle;
     ApplyPbzTheme(s_lastWindowOpacity);
-    if (nameUtf8.empty() || nameUtf8 == "ink") return;
+    if (nameUtf8.empty() || nameUtf8 == "ink") {
+        CaptureBaseStyle();
+        return;
+    }
 
     // Stems only - the name ends up in a path below.
     for (unsigned char ch : nameUtf8) {
         if (!(isalnum(ch) || ch == '_' || ch == '-' || ch == ' ')) {
             Log("[theme] rejected theme name: %s", nameUtf8.c_str());
+            CaptureBaseStyle();
             return;
         }
     }
@@ -222,6 +253,7 @@ void ApplyThemeByName(const std::string& nameUtf8) {
     std::map<std::string, std::string> raw;
     if (text.empty() || !ParseFlatJsonRaw(text, raw)) {
         Log("[theme] theme file missing or unparsable: %ls", path.c_str());
+        CaptureBaseStyle();
         return;
     }
 
@@ -245,6 +277,7 @@ void ApplyThemeByName(const std::string& nameUtf8) {
         if (ApplyFloatStyle(kv.first, (float)strtod(kv.second.c_str(), nullptr))) ++applied;
     }
     Log("[theme] applied %d overrides from %ls", applied, path.c_str());
+    CaptureBaseStyle();
 }
 
 std::vector<std::string> ListThemeNames() {

@@ -19,6 +19,18 @@ namespace {
 std::mutex g_cfgMtx;
 std::vector<std::unique_ptr<ConfigDef>> g_configs;
 
+// ImGui 1.92 scales glyphs via style.FontScaleMain but leaves explicit ImVec2
+// sizes untouched. A fixed 150px key-cap button therefore clips long key names
+// as soon as the UI scale is raised. Keep the old footprint as the scaled
+// minimum and reserve enough room for the label itself.
+float KeyButtonWidth(const char* label) {
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float fontScale = st.FontSizeBase > 0.0f ? ImGui::GetFontSize() / st.FontSizeBase : 1.0f;
+    const float minWidth = 150.0f * fontScale;
+    const float textWidth = ImGui::CalcTextSize(label).x + st.FramePadding.x * 2.0f + 2.0f * fontScale;
+    return std::max(minWidth, textWidth);
+}
+
 std::wstring Utf8ToWide(const std::string& u);
 
 std::wstring DataDir() { return RootFile(L"data"); }
@@ -267,18 +279,27 @@ void RenderSchemaForm(ConfigDef& cfg, const I18n& i18n, float dt) {
                 break;
             }
             case SCH_KEY: {
-                ImGui::TextUnformatted(i18n.T(it.label.c_str()));
-                ImGui::SameLine(0.0f, 12.0f);
+                const char* label = i18n.T(it.label.c_str());
                 char kb[64];
                 snprintf(kb, sizeof(kb), "[%s]", Config::VkName((unsigned)it.ival));
                 bool capturing = g_captureMode.load(std::memory_order_relaxed) == 1 &&
                                  g_captureKind.load(std::memory_order_relaxed) == CAP_SCHEMA_KEY &&
                                  g_capCfg == (void*)&cfg && g_capItem == (void*)&it;
+                const char* buttonLabel = capturing ? i18n.T("capturing") : kb;
+                const float availW = ImGui::GetContentRegionAvail().x;
+                float buttonW = KeyButtonWidth(buttonLabel);
+                const float gap = 12.0f * (ImGui::GetStyle().FontSizeBase > 0.0f
+                                               ? ImGui::GetFontSize() / ImGui::GetStyle().FontSizeBase
+                                               : 1.0f);
+                const bool sameLine = ImGui::CalcTextSize(label).x + gap + buttonW <= availW;
+                if (!sameLine) buttonW = std::min(buttonW, std::max(1.0f, availW));
+                ImGui::TextUnformatted(label);
+                if (sameLine) ImGui::SameLine(0.0f, gap);
                 if (capturing) {
                     theme::PushCapturingStyle();
-                    ImGui::Button(i18n.T("capturing"), ImVec2(150.0f, 0.0f));
+                    ImGui::Button(buttonLabel, ImVec2(buttonW, 0.0f));
                     theme::PopCapturingStyle();
-                } else if (ImGui::Button(kb, ImVec2(150.0f, 0.0f))) {
+                } else if (ImGui::Button(buttonLabel, ImVec2(buttonW, 0.0f))) {
                     g_capCfg = (void*)&cfg;
                     g_capItem = (void*)&it;
                     g_captureKind.store(CAP_SCHEMA_KEY, std::memory_order_relaxed);
@@ -287,8 +308,7 @@ void RenderSchemaForm(ConfigDef& cfg, const I18n& i18n, float dt) {
                 break;
             }
             case SCH_KEYCOMBO: {
-                ImGui::TextUnformatted(i18n.T(it.label.c_str()));
-                ImGui::SameLine(0.0f, 12.0f);
+                const char* label = i18n.T(it.label.c_str());
                 unsigned vk = (unsigned)it.ival & 0xFFu;
                 unsigned mods = ((unsigned)it.ival >> 8) & 0xFu;
                 char kb[96];
@@ -296,11 +316,21 @@ void RenderSchemaForm(ConfigDef& cfg, const I18n& i18n, float dt) {
                 bool capturing = g_captureMode.load(std::memory_order_relaxed) == 1 &&
                                  g_captureKind.load(std::memory_order_relaxed) == CAP_SCHEMA_KEYCOMBO &&
                                  g_capCfg == (void*)&cfg && g_capItem == (void*)&it;
+                const char* buttonLabel = capturing ? i18n.T("capturing") : kb;
+                const float availW = ImGui::GetContentRegionAvail().x;
+                float buttonW = KeyButtonWidth(buttonLabel);
+                const float gap = 12.0f * (ImGui::GetStyle().FontSizeBase > 0.0f
+                                               ? ImGui::GetFontSize() / ImGui::GetStyle().FontSizeBase
+                                               : 1.0f);
+                const bool sameLine = ImGui::CalcTextSize(label).x + gap + buttonW <= availW;
+                if (!sameLine) buttonW = std::min(buttonW, std::max(1.0f, availW));
+                ImGui::TextUnformatted(label);
+                if (sameLine) ImGui::SameLine(0.0f, gap);
                 if (capturing) {
                     theme::PushCapturingStyle();
-                    ImGui::Button(i18n.T("capturing"), ImVec2(150.0f, 0.0f));
+                    ImGui::Button(buttonLabel, ImVec2(buttonW, 0.0f));
                     theme::PopCapturingStyle();
-                } else if (ImGui::Button(kb, ImVec2(150.0f, 0.0f))) {
+                } else if (ImGui::Button(buttonLabel, ImVec2(buttonW, 0.0f))) {
                     g_capCfg = (void*)&cfg;
                     g_capItem = (void*)&it;
                     g_captureKind.store(CAP_SCHEMA_KEYCOMBO, std::memory_order_relaxed);

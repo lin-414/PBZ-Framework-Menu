@@ -66,6 +66,26 @@ PBZPhotoMode 的实机取证（其 PROGRESS.md"六连判死"）证明了两条�
   鎏金高亮、朱砂点缀，全直角 + 1px 细边框，标题栏金线/银括角/朱砂印章装饰，
   键位捕获态为朱砂；装饰经前景绘制列表绘制，规避 1.92 窗口列表的标题栏裁剪）。
 
+## UI 缩放与 4K 自适应布局
+
+`ui_scale` 不是单纯的字体大小开关，而是整张菜单的 DPI 缩放：
+
+- `theme::ApplyUiScale()` 从不缩放的基准样式快照重建 ImGui style，同时缩放
+  `FontScaleMain` 与 `WindowPadding` / `FramePadding` / `ItemSpacing` /
+  `ScrollbarSize` 等全部间距；每帧都从基准快照重算，避免逐帧 `ScaleAllSizes()`
+  造成累积取整误差；
+- 面板初始尺寸与最小尺寸按 `ui_scale` 同比缩放；运行中拖动"界面缩放"滑条时按
+  新旧比例缩放当前面板并夹在游戏窗口内，4K 下 1.8x 的字体因此有足够空间；
+- 侧栏宽度不再写死 190px：`ComputeSidebarWidth()` 用当前字体逐项测量树节点
+  （含层级缩进、折叠箭头和子页标签），取最大所需宽度并限制在面板的 60% 以内，
+  语言切换、长模组名和 `ui_scale` 变化都不会裁掉子菜单文字；
+- 所有固定像素宽度的控件（键位按钮、设置页按钮、底部按钮）都按当前字体比例
+  计算；键位按钮还会按 `CalcTextSize` 自动加宽，空间不足时自动换行到标签下一行，
+  避免 `[CAPSLOCK]`、`[0x01]` 这类文本被 150px 常量裁切。
+
+回归截图：用 host 在 `ui_scale = 1.8` 加长英文分类名验证侧栏不被裁切；
+默认 host 流程（`ui_scale = 1.0`）的导出 rect 与可点击区域保持不变。
+
 ## 自测方式（host）
 
 自测方式：`host/pbzfm_host.exe` 注册一个名为 `UnrealWindow` 的窗口（框架寻找的目标类）、

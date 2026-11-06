@@ -6,11 +6,14 @@
 
 namespace pbzfm { namespace layout {
 
+// All constants are in ImGui units at ui_scale = 1.0. menu.cpp multiplies the
+// layout-visible ones by the effective scale so 4K text never outgrows a
+// fixed-size column; the host automation keeps using these base values at 1.0.
 constexpr float kPanelX = 100.0f;   // panel top-left, overlay client coords
 constexpr float kPanelY = 80.0f;
-constexpr float kPanelW = 660.0f;   // panel size (fixed, sidebar + content)
+constexpr float kPanelW = 660.0f;   // base panel size (multiplied by ui_scale at runtime)
 constexpr float kPanelH = 480.0f;
-constexpr float kSidebarW = 190.0f;
+constexpr float kSidebarW = 190.0f; // base sidebar floor; content-fit width is measured in menu.cpp
 constexpr float kPanelMinW = 420.0f;  // resize floor: sidebar + minimal readable content
 constexpr float kPanelMinH = 320.0f;  // title/tab bar + a usable content column
 

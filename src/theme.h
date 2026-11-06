@@ -34,8 +34,18 @@ inline ImVec4 WithAlpha(const ImVec4& c, float a) { return ImVec4(c.x, c.y, c.z,
 
 // Full-replacement style: layout paddings match the values the test host's
 // click geometry was tuned against (FramePadding 10,6 / ItemSpacing 10,6 /
-// WindowPadding 12,10) - only colors, rounding and border sizes change here.
+// WindowPadding 12,10) at ui scale 1.0 - only colors, rounding and border
+// sizes change here. ApplyUiScale() derives the effective per-frame style.
 void ApplyPbzTheme(float windowOpacity);
+
+// Rebuilds the ImGui style from the unscaled theme baseline and applies the
+// global UI scale to BOTH the font and every spacing/metric (padding, item
+// spacing, scrollbar, grab size, ...). FontScaleMain alone only grows glyphs:
+// fixed-width columns then clip their text. Call once per frame, before any
+// window or widget is submitted. Safe to call with a changing value every
+// frame: the base snapshot is never scaled in place, so scales do not
+// compound across frames.
+void ApplyUiScale(float uiScale);
 
 // Recording-state styling for key-capture buttons (cinnabar, like the game's
 // parry marks). Pair PushCapturingStyle/PopCapturingStyle.
