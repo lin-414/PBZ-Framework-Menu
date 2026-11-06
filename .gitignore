@@ -1,5 +1,6 @@
 # build artifacts
 build/
+build_engine/
 dist/
 *.obj
 
@@ -17,3 +18,7 @@ data/
 # local tooling / junk created at workspace root
 Python/
 %SystemDrive%/
+nul
+
+# clean release build (A/B package)
+build_release/

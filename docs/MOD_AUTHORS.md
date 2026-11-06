@@ -80,8 +80,12 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
 | SetSection / ConfigCreate / ConfigAdd* / AddHotkey(Ex) / OnMenuEvent 注册 | 任意（自己的线程） | 绝不在 DllMain；框架未加载就轮询；v2 导出判空后调用 |
 | 自定义页渲染回调（AddSectionItem 的 fn） | 框架渲染线程 | 仅菜单打开且你的页签选中时每帧执行；保持快速、绝不阻塞 |
 | 设置变更回调（ConfigOnChange 的 fn） | 框架渲染线程 | 每次提交编辑触发；值已更新，用 Get* 读回 |
-| 游戏热键回调（AddHotkey/AddHotkeyEx 的 fn） | 框架输入钩子线程 | 需要游戏线程的数据自行 marshal |
+| 游戏热键回调（AddHotkey/AddHotkeyEx 的 fn） | 钩子线程只入队，由渲染线程在帧外调用 | 需要游戏线程的数据自行 marshal；回调不得调用 ImGui widget、不得阻塞（会推迟下一帧） |
 | 菜单开关事件（OnMenuEvent 的 fn） | 框架渲染线程 | 打开/关闭各触发一次，open=1/0 |
+
+- **卸载与热重载**：热重载请走 UE4SS 的完整重启流程，不要在运行中 `FreeLibrary`
+  卸载模组 DLL；框架虽能在下一帧清扫已卸载回调，但运行中卸载仍可能让页面/热键
+  短暂残留在已释放内存上。
 
 ### 两类页面
 
@@ -228,6 +232,12 @@ api.AddHotkey(VK_F9, OnScreenshot, nullptr);   // 仅按下沿触发
 框架完全相同的 ImGui 版本**（框架 vendored 1.92.1），可在渲染回调里
 `ImGui::SetCurrentContext(...)` 后直接使用 ImGui 全量 API。版本不匹配 = 内存损坏：
 只在 Widget API 不够用时才用，并在发布时锁定框架 README 注明的 ImGui 版本。
+
+> **缩放注意**：框架用 `style.FontScaleMain` 做面板拖拽缩放和界面缩放，它只放大
+> 字形，不会自动放大你传给 ImGui 的显式像素尺寸（如 `ImVec2(150, 0)`）。自定义
+> 页里的固定宽度控件要么改用自动宽度，要么按
+> `ImGui::GetFontSize() / ImGui::GetStyle().FontSizeBase` 等比缩放，否则放大界面
+> 后长文本会被按钮/控件边界截断。
 
 ### 多语言
 

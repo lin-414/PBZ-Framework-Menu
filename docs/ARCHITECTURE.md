@@ -49,7 +49,9 @@ PBZPhotoMode 的实机取证（其 PROGRESS.md"六连判死"）证明了两条�
   已注册的模组热键在菜单打开时保持生效（分发后吞键、不进菜单控件；未注册的按键——
   如 PhotoMode 的截图键——仍被吞，需模组侧经 RegistryAddHotkey 注册才会分发）；
 - 光标显示/隐藏通过子类化游戏 WndProc 投递到窗口线程执行（ShowCursor 是线程相关的）；
-- 截图两条路。① 直通（按两次）：菜单打开且游戏在前台时，PBZFM.ini `passthrough_keys`
+- 截图两条路。① 直通（按两次，**可在游戏内"设置"页直接编辑**：点组合键重新捕获、× 删除、
+  "添加组合键"追加——改完立即写回 PBZFM.ini 并热更新到钩子，无需重启）：菜单打开且游戏在
+  前台时，PBZFM.ini `passthrough_keys`
   （默认 `Ctrl+P, Alt+F1`，按你工具的实际热键配置）列出的组合键不再被吞，而是打开一个
   "借用窗口"——键鼠整体放行，游戏镜头仍冻结（Raw Input 仍指向覆盖窗）、菜单仍在背后渲染。
   第一次按下开启借用（**画面无变化属正常**，框架同时合成完整组合键重放）；第二次真实按键
@@ -94,6 +96,8 @@ PBZPhotoMode 的实机取证（其 PROGRESS.md"六连判死"）证明了两条�
 加 `--synthetic` 则改走 DLL 导出的合成输入通道（PBZFM_TestInjectMove/Button/ToggleMenu/
 TestDispatchHotkey）：不经 OS 输入流，可在有人正在使用桌面时确定性回归。真实注入路径
 依赖无人干扰的输入桌面——UAC/锁屏等安全桌面激活期间 LL 钩子收不到任何输入，属系统行为。
+以上测试导出（`PBZFM_GetDemoButton` / `PBZFM_Test*`）只在 `-DPBZFM_TEST_HOOKS=ON` 的构建中
+存在，正式包默认不导出（M8）；host 回归另含 M1 原子写与 M10 PNG alpha 断言。
 非 synthetic 模式在收尾处追加直通场景（timer 15-18）：F8 开菜单 → 经
 `PBZFM_TestSetPassthrough` 配置测试组合键 Ctrl+Alt+F9（刻意避开真实工具的热键）→
 SendInput 和弦 → `PBZFM_TestPassthroughActive` 断言借用窗口开启 → 等宽限期 + 移动鼠标

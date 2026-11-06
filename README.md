@@ -43,6 +43,12 @@ Raw Input 改指向，菜单期间镜头冻结、关闭即恢复。为什么是�
 （LL 钩子链插队、Raw Input 注册归属、ClipCursor/ShowCursor 禁区、截图直通两条路），
 见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
+**方案 C（0.6.0，可选构建）**：把「冻结游戏」从全局钩子换成引擎内冻结
+（`bBlockInput` / `SetIgnore*Input`），模块不再安装任何 `WH_*_LL` 钩子、不再改 Raw Input，
+因此录屏 / 截图 / 游戏栏的全局热键在菜单打开时照常有效。设计边界、构建方式与实机
+验证清单见 [docs/ENGINE_INPUT_PLAN.md](docs/ENGINE_INPUT_PLAN.md)。默认构建仍是零依赖
+的 OS 钩子版；引擎版用 `build_engine.bat` 单独出包。
+
 ## 构建
 
 需要 VS 2022 BuildTools（C++ 工具集 + 自带 CMake/Ninja）。不依赖 RE-UE4SS 源码、
@@ -61,7 +67,7 @@ ctest --test-dir build   :: i18n 单测（也可手动跑 build\i18n_test.exe）
 ## 游戏内安装（用户用模组管理器自行完成，自动化不碰游戏目录）
 
 1. 安装 [UE4SS for PBZ](https://www.nexusmods.com/phantombladezero/mods/5)（KintaroModding fork）。
-2. 用模组管理器（或手动解压）把 `dist/PBZ-Framework-Menu_0.5.0.zip` 装到
+2. 用模组管理器（或手动解压）把 `dist/PBZ-Framework-Menu_0.6.0.zip` 装到
    `<游戏目录>\platform\steam\ue4ss\Mods\`，形成
    `ue4ss\Mods\PBZFM\{dlls\PBZFM.dll, enabled.txt, PBZFM.ini, languages\}`。
 3. 启动游戏按 F8；验证清单见包内 README.txt。排障先看 `Documents\PBZ\Logs\PBZFM.log`
@@ -88,7 +94,7 @@ MIT，见 [LICENSE](LICENSE)。**SDK 头（sdk/pbzfm.h）对客户端模组零�
 src/            PBZFM.dll 源码（pbzfm 入口 / overlay DComp 渲染 / input 钩子 /
                 gamepad XInput 手柄 / game_window 定位与子类化 / config / i18n / menu /
                 theme（含 JSON 主题）/ textures / api+registry+schema 模组注册 C API）
-sdk/            模组接入头文件 pbzfm.h（ABI v2：可选解析 + 兼容策略随头分发）
+sdk/            模组接入头文件 pbzfm.h（API v3：可选解析 + 兼容策略随头分发）
 host/           测试宿主（模拟 UnrealWindow + 脚本输入 + 截图；demo_mod.cpp 为模组接入参考实现）
 assets/         随包分发文件（PBZFM.ini、languages/*.json、README.txt）
 tests/          i18n 单测（CTest）
@@ -107,7 +113,7 @@ docs/           架构与实机铁律 / 接入指南 / 验证记录 / 自测截�
    源码保留在 src/gamepad.*（未编译，恢复步骤见 gamepad.h 头注）。剩余：游戏暂停
    （复用 PBZPhotoMode 已验证的暂停栈）。
 3. 把 PBZPhotoMode 的 ImGui 诊断面板接成第一个客户端（其 MenuView/MenuActions 快照桥
-   直接复用），顺带压测 SDK v2 的事件/纹理/生命周期路径。
+   直接复用），顺带压测 SDK v3 的事件/纹理/生命周期路径。
 4. 参考项目已验证可行的后续方向：每模组翻译文件（languages/<store>.json，模组自带
    翻译不必等框架发版）、自定义字体文件夹 + 字形范围开关、呼出键模式（双击/长按 +
    ConsumeToggleKey）、模组分组/归档/排序（0.5.0 已有分类树，模组组织仍开放）、

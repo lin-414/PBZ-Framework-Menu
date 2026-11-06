@@ -12,7 +12,7 @@ struct GameWindow {
     int  x = 0, y = 0, w = 0, h = 0;   // client origin on screen + client size
 
     bool Find();              // locate + attach (subclass). false when none found.
-    void Detach();
+    bool Detach();            // restore the original WndProc; false when it could not be guaranteed
     bool Valid() const;       // hwnd still alive, visible, same class
     bool UpdateGeometry();    // refresh x/y/w/h; returns true when changed
     void ShowCursor(bool show); // posts to the window's owning thread

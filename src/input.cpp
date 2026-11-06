@@ -2,6 +2,7 @@
 #include "common.h"
 #include "registry.h"
 #include <imgui.h>
+#include <algorithm>
 #include <mutex>
 #include <set>
 #include <deque>
@@ -13,9 +14,55 @@ namespace {
 std::mutex g_queueMutex;
 std::deque<InputEvent> g_queue;
 
+// L1: the old "queue full -> silently drop" could swallow a key-up and leave
+// ImGui convinced the key is still held. Drops are now counted and reported by
+// the render thread (throttled), so the hook callback never blocks on logging.
+constexpr size_t kQueueMax = 256;
+std::atomic<unsigned> g_queueDropPending{ 0 };   // dropped since the last report
+std::atomic<unsigned> g_queueDropTotal{ 0 };     // dropped since the last reset
+std::atomic<DWORD> g_queueDropLogTick{ 0 };
+
+void NoteDropLocked(unsigned n) {
+    g_queueDropPending.fetch_add(n, std::memory_order_relaxed);
+    g_queueDropTotal.fetch_add(n, std::memory_order_relaxed);
+}
+
+// Lock held: evict the least harmful queued event to make room. Move (position
+// only) first, then wheel, then a down-edge. Up-edges are never evicted: losing
+// one leaves a key/button logically pressed in ImGui.
+bool EvictForRoomLocked() {
+    for (auto it = g_queue.begin(); it != g_queue.end(); ++it) {
+        if (it->type == InputEvent::Move) { g_queue.erase(it); return true; }
+    }
+    for (auto it = g_queue.begin(); it != g_queue.end(); ++it) {
+        if (it->type == InputEvent::Wheel) { g_queue.erase(it); return true; }
+    }
+    for (auto it = g_queue.begin(); it != g_queue.end(); ++it) {
+        if ((it->type == InputEvent::Key || it->type == InputEvent::Btn) && it->down) {
+            g_queue.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
 void Push(const InputEvent& e) {
     std::lock_guard<std::mutex> lock(g_queueMutex);
-    if (g_queue.size() < 256) g_queue.push_back(e);
+    if (g_queue.size() >= kQueueMax) {
+        if (!EvictForRoomLocked()) {
+            bool upEdge = (e.type == InputEvent::Key || e.type == InputEvent::Btn) && !e.down;
+            // L1: an all-up-edge queue cannot happen from a balanced stream, but
+            // if it does keep the newest up-edge (the current state) and drop the
+            // oldest one; otherwise keep the old transitions and drop this event.
+            if (upEdge) {
+                g_queue.pop_front();
+            } else {
+                NoteDropLocked(1);
+                return;
+            }
+        }
+    }
+    g_queue.push_back(e);
 }
 
 // Motion carries position only, so a run of moves collapses into the newest
@@ -27,20 +74,37 @@ void PushMove(float x, float y) {
         g_queue.back().wy = y;
         return;
     }
-    if (g_queue.size() < 256) {
-        InputEvent e{};
-        e.type = InputEvent::Move;
-        e.wx = x;
-        e.wy = y;
-        g_queue.push_back(e);
+    if (g_queue.size() >= kQueueMax && !EvictForRoomLocked()) {
+        NoteDropLocked(1);   // L1: the event that mattered least is another move
+        return;
     }
+    InputEvent e{};
+    e.type = InputEvent::Move;
+    e.wx = x;
+    e.wy = y;
+    g_queue.push_back(e);
 }
 
 HANDLE g_hookThread = nullptr;
-DWORD  g_hookThreadId = 0;
+std::atomic<DWORD> g_hookThreadId{ 0 };
 HHOOK g_kbHook = nullptr;
 HHOOK g_mouseHook = nullptr;
 bool g_toggleWasDown = false;
+// H9: all hook handle writes (install, rehook, unhook-on-stop, unhook-on-exit)
+// take this mutex, so InputStop() unhooking from the shutting-down thread can
+// never race the hook thread's RehookNow() into leaving a live hook behind.
+std::mutex g_hookMtx;
+
+void UninstallHooksLocked() {
+    if (g_kbHook) {
+        UnhookWindowsHookEx(g_kbHook);
+        g_kbHook = nullptr;
+    }
+    if (g_mouseHook) {
+        UnhookWindowsHookEx(g_mouseHook);
+        g_mouseHook = nullptr;
+    }
+}
 
 // Thread message: unhook + rehook, making our hooks the newest (first run)
 // in the LL chain again. Posted from the render thread on menu open.
@@ -193,8 +257,8 @@ void PtSendReplay() {
 }
 
 void RehookNow() {
-    if (g_kbHook) UnhookWindowsHookEx(g_kbHook);
-    if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
+    std::lock_guard<std::mutex> lock(g_hookMtx);
+    UninstallHooksLocked();
     g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbProc, GetModuleHandleW(nullptr), 0);
     g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, GetModuleHandleW(nullptr), 0);
     Log("[input] hooks re-queued to chain front (kb=%p mouse=%p)", (void*)g_kbHook, (void*)g_mouseHook);
@@ -266,38 +330,44 @@ LRESULT CALLBACK KbProc(int code, WPARAM w, LPARAM l) {
 
     if (vk == VK_LWIN || vk == VK_RWIN) return CallNextHookEx(g_kbHook, code, w, l);
 
+    // H2: capture is only meaningful while the menu owns the input. Take the
+    // visibility snapshot first and gate the capture branch on it, so a capture
+    // flag left set after the menu closed can never swallow gameplay keys.
+    static bool ptWasOpen = false;
+    bool menuOpenNow = g_menuOpen.load(std::memory_order_relaxed);
+    // Menu-open edge: fold in the modifiers held before the open (they were
+    // passed while closed, so the async state is accurate for them).
+    if (menuOpenNow && !ptWasOpen) g_ptMods |= PtAsyncMods();
+    ptWasOpen = menuOpenNow;
+
     // Key capture flow: first non-modifier key completes the capture; the
     // tracked modifier state at that moment rides along (v2 chord captures
     // use it, single-key captures ignore it).
-    if (g_captureMode.load(std::memory_order_relaxed) == 1) {
+    if (menuOpenNow && g_captureMode.load(std::memory_order_relaxed) == 1) {
         if (!up && !IsModifier(vk)) {
             g_capturedVk.store(vk, std::memory_order_release);
-            g_capturedMods.store(g_ptMods & 0xFu, std::memory_order_release);
+            // M6: Win is passed through to the shell (see the early-out above),
+            // so it can never be part of a usable chord; record only Ctrl/Shift
+            // /Alt and let the hint text stop promising Win support.
+            g_capturedMods.store(g_ptMods & 0x7u, std::memory_order_release);
             g_captureMode.store(0, std::memory_order_relaxed);
         }
         return 1;  // never let capture strokes reach the game
     }
 
-    // Menu-open edge: fold in the modifiers held before the open (they were
-    // passed while closed, so the async state is accurate for them).
-    static bool ptWasOpen = false;
-    bool menuOpenNow = g_menuOpen.load(std::memory_order_relaxed);
-    if (menuOpenNow && !ptWasOpen) g_ptMods |= PtAsyncMods();
-    ptWasOpen = menuOpenNow;
-
     if (vk == g_toggleVk.load(std::memory_order_relaxed)) {
         if (g_ptActive.load(std::memory_order_relaxed)) PtClose("menu toggled");
         if (!up && !g_toggleWasDown) g_wantToggle.store(true, std::memory_order_release);
         g_toggleWasDown = !up;
-        if (g_menuOpen.load(std::memory_order_relaxed)) return 1;
+        if (menuOpenNow) return 1;
         return CallNextHookEx(g_kbHook, code, w, l);  // closed: game also sees the key
     }
 
-    if (!g_menuOpen.load(std::memory_order_relaxed)) {
+    if (!menuOpenNow) {
         if (g_ptActive.load(std::memory_order_relaxed)) PtClose("menu closed");
-        // Registered mod hotkeys fire while the menu is closed; when one
-        // matches, the key is swallowed before the game sees it.
-        if (RegistryDispatchHotkey(vk, up, g_ptMods)) return 1;
+        // H6: registered mod hotkeys fire while the menu is closed, but only
+        // through the render-thread queue - never inside the LL hook.
+        if (RegistryQueueHotkey(vk, up, g_ptMods)) return 1;
         return CallNextHookEx(g_kbHook, code, w, l);
     }
 
@@ -354,7 +424,7 @@ LRESULT CALLBACK KbProc(int code, WPARAM w, LPARAM l) {
                 // replay the whole chord synthetically; the injected events
                 // come back through the active branch below.
                 g_ptPendingReplay = hit;
-                PostThreadMessageW(g_hookThreadId, WM_APP_PBZFM_REPLAY, 0, 0);
+                PostThreadMessageW(g_hookThreadId.load(std::memory_order_relaxed), WM_APP_PBZFM_REPLAY, 0, 0);
                 Log("[input] passthrough entered: %s (replayed)", nm.c_str());
                 return 1;
             }
@@ -378,8 +448,9 @@ LRESULT CALLBACK KbProc(int code, WPARAM w, LPARAM l) {
 
     // Registered mod hotkeys stay live while the menu is open (screenshot /
     // photo-mode toggles are meta-features, not game input). A dispatched key
-    // is swallowed and does not reach the menu widgets either.
-    if (RegistryDispatchHotkey(vk, up, g_ptMods)) return 1;
+    // is swallowed and does not reach the menu widgets either. H6: queued, the
+    // callback runs on the render thread.
+    if (RegistryQueueHotkey(vk, up, g_ptMods)) return 1;
 
     int ik = VkToImGuiKey(vk);
     if (ik != ImGuiKey_None) {
@@ -423,8 +494,15 @@ LRESULT CALLBACK MouseProc(int code, WPARAM w, LPARAM l) {
             e.type = InputEvent::Btn; e.key = 1; e.down = (w == WM_RBUTTONDOWN); Push(e); return 1;
         case WM_MBUTTONDOWN: case WM_MBUTTONUP:
             e.type = InputEvent::Btn; e.key = 2; e.down = (w == WM_MBUTTONDOWN); Push(e); return 1;
-        case WM_XBUTTONDOWN: case WM_XBUTTONUP:
-            e.type = InputEvent::Btn; e.key = 3 + HIWORD(s->mouseData); e.down = (w == WM_XBUTTONDOWN); Push(e); return 1;
+        case WM_XBUTTONDOWN: case WM_XBUTTONUP: {
+            // B3: XBUTTON1/2 map to ImGui buttons 3/4. The old base 3 turned
+            // XBUTTON2 into 5, one past ImGuiMouseButton_COUNT (5), indexing
+            // MouseDown[5] out of bounds (the assert is compiled out in
+            // Release). Down and up share this mapping, so they stay paired.
+            unsigned xb = HIWORD(s->mouseData);
+            if (xb != XBUTTON1 && xb != XBUTTON2) return 1;   // unknown side button: swallow only
+            e.type = InputEvent::Btn; e.key = 2 + (int)xb; e.down = (w == WM_XBUTTONDOWN); Push(e); return 1;
+        }
         case WM_MOUSEWHEEL:
             e.type = InputEvent::Wheel; e.wx = 0.0f; e.wy = (float)GET_WHEEL_DELTA_WPARAM(s->mouseData) / (float)WHEEL_DELTA;
             Push(e); return 1;
@@ -459,10 +537,13 @@ LRESULT CALLBACK MouseProc(int code, WPARAM w, LPARAM l) {
 }
 
 DWORD WINAPI HookThread(LPVOID) {
-    g_hookThreadId = GetCurrentThreadId();
-    g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbProc, GetModuleHandleW(nullptr), 0);
-    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, GetModuleHandleW(nullptr), 0);
-    Log("[input] hooks installed (kb=%p mouse=%p)", (void*)g_kbHook, (void*)g_mouseHook);
+    g_hookThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(g_hookMtx);
+        g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbProc, GetModuleHandleW(nullptr), 0);
+        g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, GetModuleHandleW(nullptr), 0);
+        Log("[input] hooks installed (kb=%p mouse=%p)", (void*)g_kbHook, (void*)g_mouseHook);
+    }
     MSG msg;
     while (g_running.load(std::memory_order_relaxed) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (msg.message == WM_APP_PBZFM_REHOOK) { RehookNow(); continue; }
@@ -470,9 +551,10 @@ DWORD WINAPI HookThread(LPVOID) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    if (g_kbHook) UnhookWindowsHookEx(g_kbHook);
-    if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
-    g_kbHook = g_mouseHook = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_hookMtx);
+        UninstallHooksLocked();
+    }
     Log("[input] hooks removed");
     return 0;
 }
@@ -484,25 +566,120 @@ bool InputStart() {
     return g_hookThread != nullptr;
 }
 
-void InputStop() {
-    if (g_hookThread) {
-        // PostMessage cannot reach GetMessageW reliably without a window; post a quit via thread message.
-        PostThreadMessageW(GetThreadId(g_hookThread), WM_QUIT, 0, 0);
-        WaitForSingleObject(g_hookThread, 3000);
-        CloseHandle(g_hookThread);
-        g_hookThread = nullptr;
+bool InputStop() {
+    if (!g_hookThread) return true;
+    // H9: unhook BEFORE joining. UnhookWindowsHookEx is process-wide and
+    // synchronous, so once it returns the game's input chain no longer enters
+    // our code even if the hook thread is wedged inside GetMessageW (which a
+    // plain PostThreadMessage can miss). Order matters: join first would leave
+    // the hooks live while we wait.
+    {
+        std::lock_guard<std::mutex> lock(g_hookMtx);
+        UninstallHooksLocked();
     }
-}
-
-bool InputPop(InputEvent* out) {
-    std::lock_guard<std::mutex> lock(g_queueMutex);
-    if (g_queue.empty()) return false;
-    *out = g_queue.front();
-    g_queue.pop_front();
+    const DWORD tid = g_hookThreadId.load(std::memory_order_relaxed);
+    bool posted = false;
+    for (int i = 0; i < 20 && !posted; ++i) {
+        // The message queue may not exist yet right after InputStart; retry
+        // briefly instead of silently leaving GetMessageW blocked forever.
+        posted = tid != 0 && PostThreadMessageW(tid, WM_QUIT, 0, 0) != 0;
+        if (!posted) Sleep(5);
+    }
+    if (!posted) Log("[input] WARNING: WM_QUIT could not be posted (tid=%lu err=%lu)", tid, GetLastError());
+    if (WaitForSingleObject(g_hookThread, 3000) != WAIT_OBJECT_0) {
+        // H9: never close the handle while the thread may still execute our
+        // code - keeping it signals "not safe to unload" to the caller (which
+        // pins the module instead of letting UE4SS FreeLibrary it).
+        Log("[input] ERROR: hook thread still running after 3s - module must not be unloaded");
+        return false;
+    }
+    CloseHandle(g_hookThread);
+    g_hookThread = nullptr;
+    g_hookThreadId.store(0, std::memory_order_relaxed);
     return true;
 }
 
+bool InputPop(InputEvent* out) {
+    bool got = false;
+    {
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        if (!g_queue.empty()) {
+            *out = g_queue.front();
+            g_queue.pop_front();
+            got = true;
+        }
+    }
+    // L1: report drops from the render thread (at most one WARNING per 5 s) so
+    // the hook callback never takes the log mutex.
+    unsigned pending = g_queueDropPending.load(std::memory_order_relaxed);
+    if (pending) {
+        DWORD now = GetTickCount();
+        DWORD last = g_queueDropLogTick.load(std::memory_order_relaxed);
+        if (now - last >= 5000 && g_queueDropLogTick.compare_exchange_strong(last, now)) {
+            pending = g_queueDropPending.exchange(0, std::memory_order_relaxed);
+            Log("[input] WARNING: queue full - dropped %u event(s) (%u total this session)",
+                pending, g_queueDropTotal.load(std::memory_order_relaxed));
+        }
+    }
+    return got;
+}
+
+// L1: closing the menu ends an input session; the counters must not accumulate
+// across sessions (a new session's first warning should reflect its own drops).
+void InputResetDropStats() {
+    g_queueDropPending.store(0, std::memory_order_relaxed);
+    g_queueDropTotal.store(0, std::memory_order_relaxed);
+    g_queueDropLogTick.store(0, std::memory_order_relaxed);
+}
+
+// L3: a session boundary leaves unread Move events in the queue (the frame that
+// closed the menu never drained the tail). Clearing them makes the first cursor
+// position of the next open come from the real GetCursorPos seed, not from a
+// stale tail that would snap the cursor.
+void InputClearPendingMoves() {
+    std::lock_guard<std::mutex> lock(g_queueMutex);
+    g_queue.erase(std::remove_if(g_queue.begin(), g_queue.end(),
+        [](const InputEvent& e) { return e.type == InputEvent::Move; }),
+        g_queue.end());
+}
+
 void InputPushEvent(const InputEvent& e) { Push(e); }
+
+// ---- 方案 C：窗口消息输入通道 ---------------------------------------------
+// 与钩子路径共用同一条队列；区别只是事件来源从 LL 钩子换成窗口消息。
+void InputPushKeyVk(unsigned vk, bool down) {
+    int ik = VkToImGuiKey(vk);
+    if (ik == ImGuiKey_None) return;
+    InputEvent e{};
+    e.type = InputEvent::Key;
+    e.key = ik;
+    e.down = down;
+    Push(e);
+}
+
+void InputPushMouseButton(int button, bool down) {
+    if (button < 0 || button >= ImGuiMouseButton_COUNT) return;
+    InputEvent e{};
+    e.type = InputEvent::Btn;
+    e.key = button;
+    e.down = down;
+    Push(e);
+}
+
+void InputPushWheel(float dy) {
+    InputEvent e{};
+    e.type = InputEvent::Wheel;
+    e.wy = dy;
+    Push(e);
+}
+
+void InputPushMoveScreen(int screenX, int screenY) {
+    InputEvent e{};
+    e.type = InputEvent::Move;
+    e.wx = (float)screenX;
+    e.wy = (float)screenY;
+    Push(e);
+}
 
 void InputSetPassthrough(const std::vector<HotkeyChord>& chords, bool replay) {
     {
@@ -522,7 +699,8 @@ void InputSetPassthrough(const std::vector<HotkeyChord>& chords, bool replay) {
 bool InputPassthroughActive() { return g_ptActive.load(std::memory_order_relaxed); }
 
 void InputRehook() {
-    if (g_hookThreadId) PostThreadMessageW(g_hookThreadId, WM_APP_PBZFM_REHOOK, 0, 0);
+    const DWORD tid = g_hookThreadId.load(std::memory_order_relaxed);
+    if (tid) PostThreadMessageW(tid, WM_APP_PBZFM_REHOOK, 0, 0);
 }
 
 } // namespace pbzfm

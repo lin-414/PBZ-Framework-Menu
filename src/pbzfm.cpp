@@ -3,6 +3,7 @@
 // window work under the loader lock (PBZPhotoMode lesson 1.1.0).
 #include "common.h"
 #include "config.h"
+#include "engine_port.h"
 #include "i18n.h"
 #include "game_window.h"
 #include "input.h"
@@ -15,6 +16,8 @@
 #include <mutex>
 #include <algorithm>
 #include <cwctype>
+#include <string>
+#include <vector>
 #include <shlobj.h>
 
 namespace pbzfm {
@@ -28,6 +31,7 @@ std::atomic<int>  g_captureMode{ 0 };
 std::atomic<int>  g_captureKind{ 0 };
 std::atomic<UINT> g_capturedVk{ 0 };
 std::atomic<unsigned> g_capturedMods{ 0 };
+std::atomic<int>  g_captureIndex{ -1 };
 std::atomic<int>  g_btnCliX{ -1 };
 std::atomic<int>  g_btnCliY{ -1 };
 std::atomic<int>  g_btnScrX{ -1 };
@@ -45,11 +49,42 @@ namespace {
 
 HMODULE g_self = nullptr;
 HANDLE g_initThread = nullptr;
+// H9: set when InputStop/OverlayStop could not confirm a clean shutdown (a
+// thread may still execute our code). RequestShutdown then pins the module.
+std::atomic<bool> g_unloadUnsafe{ false };
+
+// H9: a failed shutdown leaves a thread that can still call into this DLL.
+// FreeLibrary then unmaps code under a running thread (instant crash). Pinning
+// makes every later FreeLibrary a no-op: the module leaks until process exit,
+// which is strictly better than a use-after-free of our .text.
+void PinModuleForUnsafeUnload(const char* why) {
+    HMODULE pinned = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                            (LPCWSTR)(uintptr_t)&PinModuleForUnsafeUnload, &pinned)) {
+        Log("ERROR: %s; module pin failed err=%lu - host MUST NOT FreeLibrary this DLL", why,
+            GetLastError());
+        return;
+    }
+    Log("ERROR: %s; module pinned - FreeLibrary is now a no-op to avoid unmapped-code crash", why);
+}
 
 std::mutex g_logMutex;
 FILE* g_logFile = nullptr;
 std::wstring g_logPath;
 bool g_logPathResolved = false;
+
+// L7: bounded log + de-duplication state. Rotation keeps at most 1 MiB live and
+// one PBZFM.log.1; an identical message inside the window is counted instead of
+// written, so a stuck loop cannot flood the disk. All guarded by g_logMutex.
+constexpr long long kLogMaxBytes = 1LL << 20;   // 1 MiB live file
+constexpr DWORD kLogDedupeMs = 5000;
+constexpr unsigned kDebugOutPerSec = 20;        // debugger-output budget
+std::string g_logLastMsg;
+DWORD g_logLastTick = 0;
+unsigned g_logRepeatSuppressed = 0;
+DWORD g_dbgWindowTick = 0;
+unsigned g_dbgWindowCount = 0;
+bool g_logRotateWarned = false;
 
 // Preferred log location: <Documents>\PBZ\Logs, created on demand. Empty when unavailable.
 std::wstring DocumentsLogsDir() {
@@ -105,22 +140,72 @@ DWORD WINAPI InitThreadProc(LPVOID) {
     InputSetPassthrough(g_cfg.passthroughKeys, g_cfg.passthroughReplay);
     g_i18n.Load(ModRoot() + L"\\languages", Utf8ToWide(g_cfg.language));
 
+    // 方案 C：先问引擎端口。可用时输入全部走引擎（APlayerController 冻结 +
+    // 引擎侧取鼠标/按键），模块既不装全局 LL 钩子也不改 Raw Input —— 系统的
+    // 录屏/截图/游戏栏热键因此完全不受影响。不可用（host 测试、没装 UE4SS、
+    // 或本构建没编引擎后端）则回退到旧路径，行为与 0.5.x 一致。
+    const bool engineInput = EnginePortInit(InputModeFromString(g_cfg.inputMode.c_str()));
+
     if (!OverlayStart(&g_gw, &g_cfg, &g_i18n, iniPath)) {
         Log("overlay failed to start - module dormant (see earlier log lines)");
+        // B2: a failed init must not leave the game window subclassed for the
+        // rest of the session. OverlayStop() is safe here (its thread handle
+        // is already closed/empty) and is the single place that detaches.
+        if (!OverlayStop()) {
+            g_unloadUnsafe.store(true, std::memory_order_relaxed);
+            Log("ERROR: subclass rollback after init failure failed");
+        }
+        EnginePortShutdown();   // 引擎后端可能已经挂了 tick 钩子，失败路径也要撤
         return 0;
     }
-    InputStart();
+    if (!engineInput) {
+        InputStart();
+        Log("[input] backend: os (global LL hooks + raw-input re-point)");
+    } else {
+        Log("[input] backend: engine - global hooks are off, system hotkeys/recording unaffected");
+    }
     Log("prototype ready: press %s to toggle the menu", Config::VkName(g_cfg.toggleVk));
 
     while (g_running.load(std::memory_order_relaxed)) Sleep(200);
 
-    InputStop();
-    OverlayStop();
-    Log("PBZFM unloaded cleanly");
+    // H9: InputStop unhooks before joining and reports a timeout; OverlayStop
+    // keeps its B2 contract (false = render thread/restore unresolved). Either
+    // failure means a thread may still be inside this DLL, so the module is
+    // marked unsafe to unload instead of pretending the shutdown was clean.
+    const bool inputOk = InputStop();
+    const bool overlayOk = OverlayStop();
+    EnginePortShutdown();
+    if (inputOk && overlayOk) {
+        Log("PBZFM unloaded cleanly");
+    } else {
+        g_unloadUnsafe.store(true, std::memory_order_relaxed);
+        Log("ERROR: shutdown incomplete (input=%d overlay=%d) - module must stay loaded",
+            (int)inputOk, (int)overlayOk);
+    }
     return 0;
 }
 
 } // namespace
+
+// L7: called with g_logMutex held and g_logFile open. Rotating at 1 MiB keeps a
+// single PBZFM.log.1; when the move fails, say so once and keep appending to the
+// same file instead of silently dropping every later line.
+static void RotateLogLocked() {
+    fclose(g_logFile);
+    g_logFile = nullptr;
+    const std::wstring backup = g_logPath + L".1";
+    if (MoveFileExW(g_logPath.c_str(), backup.c_str(), MOVEFILE_REPLACE_EXISTING) == 0) {
+        g_logFile = _wfsopen(g_logPath.c_str(), L"ab", _SH_DENYNO);
+        if (g_logFile && !g_logRotateWarned) {
+            g_logRotateWarned = true;
+            const char* msg = "[log] ERROR: rotation failed - continuing on the same file\n";
+            fwrite(msg, 1, strlen(msg), g_logFile);
+            fflush(g_logFile);
+        }
+        return;
+    }
+    g_logFile = _wfsopen(g_logPath.c_str(), L"ab", _SH_DENYNO);
+}
 
 void Log(const char* fmt, ...) {
     std::lock_guard<std::mutex> lock(g_logMutex);
@@ -140,25 +225,57 @@ void Log(const char* fmt, ...) {
             if (!g_logFile) return;
         }
     }
+    // L7: rotate at the size limit before writing this line; a failed reopen
+    // must not fall through into a null FILE*.
+    if (_ftelli64(g_logFile) >= kLogMaxBytes) RotateLogLocked();
+    if (!g_logFile) return;
     SYSTEMTIME st{};
     GetLocalTime(&st);
     char stamp[80];
     snprintf(stamp, sizeof(stamp), "[%04u-%02u-%02u %02u:%02u:%02u.%03u] ",
              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    fwrite(stamp, 1, strlen(stamp), g_logFile);
+
+    char msg[1024];
     va_list args;
     va_start(args, fmt);
-    vfprintf(g_logFile, fmt, args);
+    _vsnprintf_s(msg, sizeof(msg), _TRUNCATE, fmt, args);
     va_end(args);
+
+    const DWORD nowTick = GetTickCount();
+    // L7: an identical message inside the window is counted, not written; the
+    // summary is emitted right before the next distinct line so suppression is
+    // visible without flooding the file.
+    if (g_logLastTick && msg == g_logLastMsg && nowTick - g_logLastTick < kLogDedupeMs) {
+        ++g_logRepeatSuppressed;
+        return;
+    }
+    if (g_logRepeatSuppressed) {
+        char sum[128];
+        snprintf(sum, sizeof(sum), "%s[log] previous message repeated %u time(s)\n",
+                 stamp, g_logRepeatSuppressed);
+        fwrite(sum, 1, strlen(sum), g_logFile);
+        g_logRepeatSuppressed = 0;
+    }
+    fwrite(stamp, 1, strlen(stamp), g_logFile);
+    fwrite(msg, 1, strlen(msg), g_logFile);
     fputc('\n', g_logFile);
     fflush(g_logFile);
+    g_logLastMsg.assign(msg);
+    g_logLastTick = nowTick;
 
-    char line[1024];
-    int n = snprintf(line, sizeof(line), "%s", stamp);
-    va_start(args, fmt);
-    _vsnprintf_s(line + n, sizeof(line) - (size_t)n, _TRUNCATE, fmt, args);
-    va_end(args);
-    OutputDebugStringA(line);
+    // L7: OutputDebugString only when a debugger is attached and within a
+    // per-second budget, so input/render hot paths do not pay for it.
+    if (IsDebuggerPresent()) {
+        if (nowTick - g_dbgWindowTick >= 1000) {
+            g_dbgWindowTick = nowTick;
+            g_dbgWindowCount = 0;
+        }
+        if (++g_dbgWindowCount <= kDebugOutPerSec) {
+            char line[1104];
+            snprintf(line, sizeof(line), "%s%s", stamp, msg);
+            OutputDebugStringA(line);
+        }
+    }
 }
 
 std::wstring DllDir() {
@@ -190,11 +307,21 @@ void RequestShutdown() {
     g_running.store(false, std::memory_order_relaxed);
     if (g_initThread) {
         if (WaitForSingleObject(g_initThread, 5000) != WAIT_OBJECT_0) {
-            Log("WARNING: init thread did not exit within 5s");
+            // B2: the init thread is the only one that joins the render thread
+            // and restores the game WndProc (OverlayStop). A timeout means the
+            // restore has not happened yet: report it explicitly instead of
+            // pretending the module is unloaded, and keep the handle so a
+            // running thread never has its code freed underneath it.
+            Log("ERROR: init thread still running after 5s - overlay/WndProc shutdown unresolved");
+            // H9: the init thread may still be inside InputStop/OverlayStop.
+            PinModuleForUnsafeUnload("init thread still running after 5s");
+            return;
         }
         CloseHandle(g_initThread);
         g_initThread = nullptr;
     }
+    if (g_unloadUnsafe.load(std::memory_order_relaxed))
+        PinModuleForUnsafeUnload("shutdown reported incomplete");
 }
 
 } // namespace pbzfm
@@ -203,6 +330,20 @@ using namespace pbzfm;
 
 static void AppendLogTailToDebugger() {}
 
+#if PBZFM_TEST_HOOKS
+// M8: the test-only exports take UTF-8 paths (the host speaks UTF-8); keep the
+// conversion local to the test block so the shipped code carries no dead helper.
+static std::wstring WideFromUtf8(const char* s) {
+    if (!s || !*s) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+    if (n <= 0) return {};
+    std::wstring w((size_t)n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s, -1, w.data(), n);
+    if (!w.empty() && w.back() == 0) w.pop_back();
+    return w;
+}
+#endif
+
 BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(self);
@@ -210,7 +351,10 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
         g_running.store(true, std::memory_order_relaxed);
         g_initThread = CreateThread(nullptr, 0, InitThreadProc, nullptr, 0, nullptr);
     } else if (reason == DLL_PROCESS_DETACH) {
-        // Loader lock: only signal. Clean shutdown goes through PBZFM_Shutdown().
+        // Loader lock: only signal. The WndProc restore runs exactly once in
+        // OverlayStop() on the init thread; requesting it here as well would
+        // mean SendMessage under the loader lock and a duplicate restore.
+        // Clean unload goes through PBZFM_Shutdown()/uninstall_mod().
         g_running.store(false, std::memory_order_relaxed);
     }
     return TRUE;
@@ -219,6 +363,10 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
 extern "C" {
 
 __declspec(dllexport) void PBZFM_Shutdown() { pbzfm::RequestShutdown(); }
+
+// M8: automation-only exports. PBZFM_TEST_HOOKS is OFF in release builds, so
+// these injection hooks never reach players; the host regression turns it on.
+#if PBZFM_TEST_HOOKS
 
 // Test hook: current screen position of the demo button (host clicks here).
 __declspec(dllexport) bool PBZFM_GetDemoButton(long* x, long* y) {
@@ -272,6 +420,32 @@ __declspec(dllexport) void PBZFM_TestSetPassthrough(unsigned vk, bool ctrl, bool
     std::vector<pbzfm::HotkeyChord> chords{ pbzfm::HotkeyChord{ vk, ctrl, shift, alt, win } };
     pbzfm::InputSetPassthrough(chords, replay);
 }
+
+// M1 regression: drive the shared atomic-write primitive from the host so the
+// success path and the failure path (old store must stay intact) are both
+// assertable without launching the game.
+__declspec(dllexport) bool PBZFM_TestAtomicWrite(const char* path_utf8, const char* utf8) {
+    if (!path_utf8 || !utf8) return false;
+    return pbzfm::WriteFileAtomic(WideFromUtf8(path_utf8), std::string(utf8));
+}
+
+// M10 regression: encode a fully transparent BGRA buffer (DIB pixels carry
+// alpha 0) and write the PNG, so the host can read the pixels back and assert
+// the encoder forced alpha to 255.
+__declspec(dllexport) bool PBZFM_TestWriteAlphaPng(const char* path_utf8, int w, int h) {
+    if (!path_utf8 || w <= 0 || h <= 0 || w > 4096 || h > 4096) return false;
+    std::vector<unsigned char> bgra((size_t)w * (size_t)h * 4, 0);   // alpha deliberately 0
+    for (size_t i = 0; i < bgra.size(); i += 4) {
+        bgra[i + 0] = 0x20;
+        bgra[i + 1] = 0x80;
+        bgra[i + 2] = 0xF0;
+    }
+    std::vector<unsigned char> png;
+    if (!pbzfm::EncodeOpaqueBgraPng(bgra.data(), w, h, png)) return false;
+    return pbzfm::WriteFileAtomic(WideFromUtf8(path_utf8), std::string(png.begin(), png.end()));
+}
+
+#endif   // PBZFM_TEST_HOOKS
 
 // UE4SS C++ mod lifecycle contract (CppMod.cpp requires both exports; without
 // them UE4SS FreeLibrary's the DLL right after LoadLibraryExW). PBZFM manages

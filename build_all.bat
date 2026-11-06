@@ -9,6 +9,8 @@ if not exist "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat" (
 call "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat" >nul
 set "PATH=%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%PATH%"
 where cmake ninja cl 2>nul
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release || exit /b 1
+rem PBZFM_TEST_HOOKS=ON: the host regression drives the DLL through its test
+rem exports; release packaging must reconfigure with OFF (tools/pack.ps1 warns).
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPBZFM_TEST_HOOKS=ON || exit /b 1
 cmake --build build || exit /b 1
 echo [build] OK

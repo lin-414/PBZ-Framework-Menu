@@ -10,14 +10,17 @@ namespace pbzfm {
 
 // Opaque handle, never null for a valid path; repeated loads of the same path
 // share one entry. Relative paths resolve against the framework mod root.
+// The handle is an internal slot id + generation (review H4), so a handle whose
+// texture was released is stale, never dangling.
 void* TexturesLoad(const char* path_utf8);
 // Flags the texture for release; the GPU memory goes away on the next render
-// frame (safe to call from any thread, safe to call on a stale handle).
+// frame. Safe from any thread and safe on a stale handle (ignored + logged).
 void  TexturesDispose(void* texture);
 // True once the SRV is live; only the render thread may draw.
 bool  TexturesDraw(void* texture, float w, float h);
 // Render thread, once per frame before ImGui::NewFrame: complete pending
-// uploads, reap disposed entries.
+// uploads, reap disposed entries. A failed load releases its slot, so the same
+// path can be retried with a fresh LoadTexture.
 void  TexturesProcessPending();
 // Render thread teardown: release every SRV before the device goes away.
 void  TexturesShutdown();

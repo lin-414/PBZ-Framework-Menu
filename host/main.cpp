@@ -8,6 +8,9 @@
 //  - asserts on demo_mod_state.txt + data/demo.json afterwards
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
+// M10 regression: read the DLL-produced PNG back to assert its alpha channel.
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
 
 #include <windows.h>
 #include <shlobj.h>
@@ -61,6 +64,12 @@ PBZFM_TestPtActiveFn pfnPtActive;
 // uncontended input desktop (a human using the machine races the strokes).
 bool g_synthetic = false;
 int g_fail = 0;   // passthrough scenario result (exit code)
+
+// B2 regression: shutdown runs on its own thread (like UE4SS's uninstall_mod)
+// so the window thread stays free to service the WndProc restore request.
+PBZFM_ShutdownFn g_shutdownFn = nullptr;
+HANDLE g_shutdownThread = nullptr;
+int g_shutdownPolls = 0;
 
 void Log(const char* fmt, ...) {
     va_list args;
@@ -237,6 +246,14 @@ std::string ReadSmallFile(const char* path) {
     return out;
 }
 
+std::string ExeDir() {
+    char path[MAX_PATH]{};
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    std::string d = path;
+    size_t p = d.find_last_of("\\/");
+    return p == std::string::npos ? std::string(".") : d.substr(0, p);
+}
+
 int FindSectionByUtf8Name(const char* name) {
     if (!pfnSectionCount || !pfnSectionName) return -1;
     for (int i = 0; i < pfnSectionCount(); ++i) {
@@ -266,12 +283,155 @@ void DumpArtifacts() {
     Log("--- PBZFM.log (%s) ---\n%s", logPath.c_str(), ReadSmallFile(logPath.c_str()).c_str());
 }
 
+void AssertSchemaRoundTrip() {
+    char dir[MAX_PATH]{};
+    GetModuleFileNameA(nullptr, dir, MAX_PATH);
+    std::string d = dir;
+    size_t p = d.find_last_of("\\/");
+    if (p != std::string::npos) d = d.substr(0, p);
+    std::string json = ReadSmallFile((d + "\\data\\demo.json").c_str());
+    // B1 regression: values seeded on disk before the mod declared its controls
+    // must survive the load and be written back unchanged on menu close.
+    static const char* const kNeedles[] = { "\"fov\": 120", "\"quality\": 3", "\"shot_key\": 66" };
+    static const char* const kWhat[] = { "fov", "quality", "shot_key" };
+    for (int i = 0; i < 3; ++i) {
+        bool ok = json.find(kNeedles[i]) != std::string::npos;
+        Log("B1 regression: %-8s disk value round-trip %s", kWhat[i], ok ? "PASS" : "FAIL");
+        if (!ok) g_fail = 1;
+    }
+}
+
+void AssertWindowRestored() {
+    // B2 regression: PBZFM_Shutdown joins the render thread and restores the
+    // host WndProc; a still-subclassed window would mean the restore never ran.
+    bool alive = IsWindow(g_hwnd) != FALSE;
+    LONG_PTR proc = GetWindowLongPtrW(g_hwnd, GWLP_WNDPROC);
+    bool restored = proc == (LONG_PTR)HostWndProc;
+    Log("B2 regression: window alive=%d wndproc=%s %s", alive ? 1 : 0,
+        restored ? "HostWndProc" : "STILL SUBCLASSED", (alive && restored) ? "PASS" : "FAIL");
+    if (!alive || !restored) g_fail = 1;
+}
+
+// M1 regression: the store write must either land whole or leave the previous
+// file untouched. The failure path is forced by putting a directory on the
+// temp name, so CreateFileW(tmp) fails and the old store must survive.
+void AssertAtomicWrite() {
+    typedef bool (*AtomicWriteFn)(const char*, const char*);
+    AtomicWriteFn fn = (AtomicWriteFn)GetProcAddress(g_dll, "PBZFM_TestAtomicWrite");
+    if (!fn) {
+        Log("M1 regression: PBZFM_TestAtomicWrite missing - SKIP (configure with -DPBZFM_TEST_HOOKS=ON)");
+        return;
+    }
+    std::string dir = ExeDir() + "\\data";
+    std::string okPath = dir + "\\atomic_ok.txt";
+    std::string failPath = dir + "\\atomic_fail.txt";
+    std::string tmpSquat = failPath + ".tmp";
+    auto seed = [](const std::string& p, const char* text) {
+        FILE* f = nullptr;
+        if (fopen_s(&f, p.c_str(), "wb") != 0 || !f) return false;
+        fputs(text, f);
+        fclose(f);
+        return true;
+    };
+    bool seeded = seed(okPath, "OLD") && seed(failPath, "KEEP");
+    bool wrote = seeded && fn(okPath.c_str(), "NEW");
+    bool content = ReadSmallFile(okPath.c_str()) == "NEW";
+    bool tmpGone = GetFileAttributesA((okPath + ".tmp").c_str()) == INVALID_FILE_ATTRIBUTES;
+    // Clear leftovers from an interrupted run first: a stale object on the temp
+    // name would make CreateDirectoryA fail with ERROR_ALREADY_EXISTS and skip
+    // the failure-path assertion entirely.
+    DeleteFileA(tmpSquat.c_str());
+    RemoveDirectoryA(tmpSquat.c_str());
+    bool blocked = CreateDirectoryA(tmpSquat.c_str(), nullptr) != FALSE;
+    DWORD blockErr = blocked ? 0 : GetLastError();
+    bool refused = blocked && !fn(failPath.c_str(), "REPLACED");
+    bool kept = ReadSmallFile(failPath.c_str()) == "KEEP";
+    RemoveDirectoryA(tmpSquat.c_str());
+    bool pass = seeded && wrote && content && tmpGone && refused && kept;
+    Log("M1 regression: atomic write (write=%d content=%d tmp-removed=%d refused=%d old-kept=%d blocked=%d err=%lu) %s",
+        wrote ? 1 : 0, content ? 1 : 0, tmpGone ? 1 : 0, refused ? 1 : 0, kept ? 1 : 0,
+        blocked ? 1 : 0, blockErr, pass ? "PASS" : "FAIL");
+    if (!pass) g_fail = 1;
+}
+
+// M10 regression: DIB pixels carry alpha 0, so the encoder must force alpha to
+// 255 before writing the PNG; read it back and inspect the pixel data.
+void AssertPngAlpha() {
+    typedef bool (*WriteAlphaPngFn)(const char*, int, int);
+    WriteAlphaPngFn fn = (WriteAlphaPngFn)GetProcAddress(g_dll, "PBZFM_TestWriteAlphaPng");
+    if (!fn) {
+        Log("M10 regression: PBZFM_TestWriteAlphaPng missing - SKIP (configure with -DPBZFM_TEST_HOOKS=ON)");
+        return;
+    }
+    std::string path = ExeDir() + "\\shots\\png_alpha_test.png";
+    bool wrote = fn(path.c_str(), 16, 16);
+    int w = 0, h = 0, comp = 0;
+    unsigned char* px = wrote ? stbi_load(path.c_str(), &w, &h, &comp, 4) : nullptr;
+    bool opaque = px && w == 16 && h == 16;
+    if (opaque) {
+        for (int i = 0; i < w * h; ++i) {
+            if (px[i * 4 + 3] != 255) { opaque = false; break; }
+        }
+    }
+    stbi_image_free(px);
+    Log("M10 regression: PNG alpha (%dx%d, all 255) %s", w, h, opaque ? "PASS" : "FAIL");
+    if (!opaque) g_fail = 1;
+}
+
+// L5 regression: removing a hotkey must forget its "held" bit, otherwise
+// registering the same chord again would swallow the next press.
+static int g_hotkeyProbeFires = 0;
+static void HotkeyProbe(void*) { ++g_hotkeyProbeFires; }
+
+void AssertHotkeyReregister() {
+    typedef int (*AddHotkeyExFn)(unsigned, unsigned, void (*)(void*), void*);
+    typedef void (*RemoveHotkeyFn)(int);
+    AddHotkeyExFn add = (AddHotkeyExFn)GetProcAddress(g_dll, "PBZFM_AddHotkeyEx");
+    RemoveHotkeyFn rem = (RemoveHotkeyFn)GetProcAddress(g_dll, "PBZFM_RemoveHotkey");
+    if (!add || !rem || !pfnDispatchHotkey) {
+        Log("L5 regression: hotkey exports missing - SKIP (configure with -DPBZFM_TEST_HOOKS=ON)");
+        return;
+    }
+    const unsigned kVk = VK_F10;   // demo mod uses F9; F10 is free in the host scenario
+    g_hotkeyProbeFires = 0;
+    int id = add(kVk, 0, HotkeyProbe, nullptr);
+    bool first = id != 0 && pfnDispatchHotkey(kVk) && g_hotkeyProbeFires == 1;
+    rem(id);
+    int again = add(kVk, 0, HotkeyProbe, nullptr);
+    bool second = again != 0 && pfnDispatchHotkey(kVk) && g_hotkeyProbeFires == 2;
+    rem(again);
+    bool pass = first && second;
+    Log("L5 regression: hotkey re-register (first press=%d after re-register=%d) %s",
+        first ? 1 : 0, second ? 1 : 0, pass ? "PASS" : "FAIL");
+    if (!pass) g_fail = 1;
+}
+
+DWORD WINAPI ShutdownThread(LPVOID) {
+    if (g_shutdownFn) g_shutdownFn();
+    return 0;
+}
+
 void Finish() {
+    AssertSchemaRoundTrip();
     DumpArtifacts();
     if (g_demo) { FreeLibrary(g_demo); g_demo = nullptr; }
     if (g_dll) {
-        auto shutdownFn = (PBZFM_ShutdownFn)GetProcAddress(g_dll, "PBZFM_Shutdown");
-        if (shutdownFn) shutdownFn();
+        g_shutdownFn = (PBZFM_ShutdownFn)GetProcAddress(g_dll, "PBZFM_Shutdown");
+        if (g_shutdownFn) {
+            // Do not call it inline: PBZFM_Shutdown joins the init thread,
+            // which posts the WndProc restore to this window thread. Blocking
+            // this thread would make that restore time out (B2's exact path).
+            g_shutdownThread = CreateThread(nullptr, 0, ShutdownThread, nullptr, 0, nullptr);
+            if (g_shutdownThread) {
+                SetTimer(g_hwnd, 19, 200, nullptr);
+                return;   // keep pumping; timer 19 finishes the run
+            }
+            Log("ERROR: shutdown thread creation failed - calling inline");
+            g_shutdownFn();
+        }
+        // Verify the WndProc restore while PBZFM.dll is still mapped - its
+        // original proc lives in that module.
+        AssertWindowRestored();
         FreeLibrary(g_dll);
         g_dll = nullptr;
     }
@@ -309,6 +469,22 @@ int main(int argc, char** argv) {
     CreateDirectoryA("shots", nullptr);
     DeleteFileA("demo_mod_state.txt");
 
+    // B1 regression seed: values already on disk when the mod declares its
+    // controls. If the framework applies them (two-phase load), the close-time
+    // save writes them back; AssertSchemaRoundTrip() checks that later.
+    CreateDirectoryA("data", nullptr);
+    {
+        FILE* f = nullptr;
+        if (fopen_s(&f, "data\\demo.json", "w") == 0 && f) {
+            fputs("{\n  \"enable_fx\": true,\n  \"fov\": 120,\n  \"quality\": 3,\n  \"shot_key\": 66\n}\n", f);
+            fclose(f);
+            Log("B1 regression: seeded data/demo.json (fov=120 quality=3 shot_key=66)");
+        } else {
+            Log("B1 regression: seed write FAILED");
+            g_fail = 1;
+        }
+    }
+
     g_dll = LoadLibraryW(L"PBZFM.dll");
     if (!g_dll) {
         Log("LoadLibrary(PBZFM.dll) failed err=%lu", GetLastError());
@@ -330,6 +506,17 @@ int main(int argc, char** argv) {
     pfnDispatchHotkey = (PBZFM_TestDispatchHotkeyFn)GetProcAddress(g_dll, "PBZFM_TestDispatchHotkey");
     pfnSetPassthrough = (PBZFM_TestSetPassthroughFn)GetProcAddress(g_dll, "PBZFM_TestSetPassthrough");
     pfnPtActive = (PBZFM_TestPtActiveFn)GetProcAddress(g_dll, "PBZFM_TestPassthroughActive");
+
+    // M8: --synthetic drives the DLL only through test exports, so a release
+    // build (PBZFM_TEST_HOOKS=OFF) cannot run this scenario - say so instead of
+    // silently timing out.
+    if (g_synthetic && (!pfnToggleMenu || !pfnInjectMove || !pfnInjectButton)) {
+        Log("ERROR: --synthetic needs a PBZFM_TEST_HOOKS=ON build (test exports missing)");
+        return 3;
+    }
+    AssertAtomicWrite();
+    AssertPngAlpha();
+    AssertHotkeyReregister();
 
     SetTimer(g_hwnd, 1, 900, nullptr);    // shot 00_initial
     SetTimer(g_hwnd, 2, 1500, nullptr);   // F8 -> menu
@@ -459,6 +646,26 @@ int main(int argc, char** argv) {
                     Log("F8 (close, passthrough scenario)");
                     SendKey(VK_F8);
                     break;
+                case 19: {
+                    g_shutdownPolls++;
+                    if (WaitForSingleObject(g_shutdownThread, 0) == WAIT_OBJECT_0) {
+                        CloseHandle(g_shutdownThread);
+                        g_shutdownThread = nullptr;
+                        AssertWindowRestored();
+                        FreeLibrary(g_dll);
+                        g_dll = nullptr;
+                        PostQuitMessage(0);
+                        break;
+                    }
+                    if (g_shutdownPolls >= 30) {   // ~6 s: report instead of hanging
+                        Log("ERROR: PBZFM_Shutdown did not finish within 6s");
+                        g_fail = 1;
+                        PostQuitMessage(0);   // do not free a DLL with a live init thread
+                        break;
+                    }
+                    SetTimer(g_hwnd, 19, 200, nullptr);
+                    break;
+                }
                 case 12:
                     SaveShot("04_closed.png");
                     Finish();

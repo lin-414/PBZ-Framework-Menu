@@ -1,4 +1,5 @@
 #include "config.h"
+#include "common.h"   // M1: WriteFileAtomic / Log live with the module entry TU
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -42,13 +43,8 @@ static std::string ReadFileText(const std::wstring& path) {
     return out;
 }
 
-static bool WriteFileText(const std::wstring& path, const std::string& utf8) {
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return false;
-    bool ok = fwrite(utf8.data(), 1, utf8.size(), f) == utf8.size();
-    fclose(f);
-    return ok;
-}
+// M1: the shared atomic primitive lives in pbzfm.cpp so config and schema
+// stores can never diverge into a torn/partial write implementation.
 
 bool Config::Load(const std::wstring& path) {
     std::string text = ReadFileText(path);
@@ -72,6 +68,7 @@ bool Config::Load(const std::wstring& path) {
         if (section == L"framework") {
             if (k == "language") language = WideToUtf8(val);
             else if (k == "toggle_key") { UINT vk = VkFromName(val); if (vk) toggleVk = vk; }
+            else if (k == "input_mode") inputMode = WideToUtf8(val);
             else if (k == "passthrough_keys") passthroughKeys = ChordsFromText(val);
             else if (k == "passthrough_replay") passthroughReplay = (val == L"1" || _wcsicmp(val.c_str(), L"true") == 0);
         } else if (section == L"ui") {
@@ -97,6 +94,10 @@ bool Config::Save(const std::wstring& path) const {
     out += "; PBZ Menu Framework prototype config\n";
     out += "\n[framework]\n";
     out += "language = " + language + "\n";
+    // 方案 C：把输入后端写回 ini，并留一段注释让玩家知道这个开关存在。
+    out += "; input_mode: auto = 能用引擎输入就用引擎（不装全局钩子, 录屏/截图热键不受影响）\n";
+    out += ";            engine = 强制引擎模式(不可用会回退并记日志); os = 旧路径(全局钩子 + Raw Input 改指向)\n";
+    out += "input_mode = " + (inputMode.empty() ? std::string("auto") : inputMode) + "\n";
     snprintf(buf, sizeof(buf), "toggle_key = %s\n", VkName(toggleVk));
     out += buf;
     std::string chords;
@@ -115,7 +116,7 @@ bool Config::Save(const std::wstring& path) const {
     snprintf(buf, sizeof(buf), "fov = %.1f\nfreeze = %s\nquality = %d\ndemo_clicks = %ld\n",
              fov, freeze ? "true" : "false", quality, clicks);
     out += buf;
-    return WriteFileText(path, out);
+    return WriteFileAtomic(path, out);
 }
 
 // "Alt+P, Alt+F1" -> two chords. Tokens are matched case-insensitively; an
@@ -138,8 +139,15 @@ std::vector<HotkeyChord> Config::ChordsFromText(const std::wstring& csv) {
             if (_wcsicmp(tok.c_str(), L"ctrl") == 0 || _wcsicmp(tok.c_str(), L"control") == 0) c.ctrl = true;
             else if (_wcsicmp(tok.c_str(), L"shift") == 0) c.shift = true;
             else if (_wcsicmp(tok.c_str(), L"alt") == 0) c.alt = true;
-            else if (_wcsicmp(tok.c_str(), L"win") == 0) c.win = true;
-            else if (!haveVk) {
+            else if (_wcsicmp(tok.c_str(), L"win") == 0) {
+                // M6: the Win key has to reach the shell (the hook passes it
+                // through), so a Win chord can never be matched reliably here;
+                // reject the whole chord and say so instead of loading a binding
+                // that looks configured but cannot fire.
+                Log("[config] Win+ is not supported, chord dropped: %ls", item.c_str());
+                valid = false;
+                break;
+            } else if (!haveVk) {
                 c.vk = VkFromName(tok);
                 haveVk = true;
                 if (!c.vk) { valid = false; break; }
@@ -173,7 +181,9 @@ std::string Config::KeyModsToString(unsigned vk, unsigned mods) {
 }
 
 const char* Config::VkName(UINT vk) {
-    static char name[16];
+    // M3: the returned buffer is thread-local - two threads (render + mod)
+    // formatting a key name concurrently no longer overwrite each other.
+    static thread_local char name[16];
     if (vk >= '0' && vk <= '9' || vk >= 'A' && vk <= 'Z') { name[0] = (char)vk; name[1] = 0; return name; }
     if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) { snprintf(name, sizeof(name), "NUMPAD%d", (int)(vk - VK_NUMPAD0)); return name; }
     if (vk >= VK_F1 && vk <= VK_F24) { snprintf(name, sizeof(name), "F%d", (int)(vk - VK_F1 + 1)); return name; }

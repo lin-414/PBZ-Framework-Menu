@@ -11,6 +11,7 @@
 #include "registry.h"
 #include "schema.h"
 #include "theme.h"
+#include "input.h"
 
 #include <imgui.h>
 #include <algorithm>
@@ -316,9 +317,12 @@ void FrameworkSettingsPage(void*) {
         // Theme picker: "ink" is the built-in 玄墨鎏金, anything else is a
         // themes\<name>.json over the built-in style (layout paddings stay
         // fixed for the host automation).
-        std::vector<std::string> names = theme::ListThemeNames();
         std::string cur = cfg.theme == "ink" ? i18n.T("theme_builtin") : cfg.theme;
         if (ImGui::BeginCombo(i18n.T("theme"), cur.c_str())) {
+            // M4: rescan only when the popup appears; the cached list is reused
+            // on every other frame instead of enumerating themes\ at 60 Hz.
+            if (ImGui::IsWindowAppearing()) theme::RefreshThemeNames();
+            const std::vector<std::string>& names = theme::ListThemeNames();
             for (const std::string& n : names) {
                 std::string label = (n == "ink") ? i18n.T("theme_builtin") : n;
                 bool sel = cfg.theme == n;
@@ -366,17 +370,51 @@ void FrameworkSettingsPage(void*) {
         ImGui::TextDisabled("%s", i18n.T("shot_saved"));
     }
 
-    // Passthrough status: what the ini lets through to screenshot tools while
-    // the menu owns the input (configured in PBZFM.ini, read at load time).
+    // Screenshot-tool passthrough chords, editable in place: click a chord to
+    // re-capture it (the shared key-capture flow records the held modifiers),
+    // x removes it, "add" appends one. Edits persist to PBZFM.ini and are
+    // handed to the running hook immediately - no restart needed.
+    ImGui::TextUnformatted(i18n.T("passthrough"));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", i18n.T("passthrough_hint"));
     {
-        std::string chords;
-        for (size_t i = 0; i < cfg.passthroughKeys.size(); ++i) {
-            if (i) chords += ", ";
-            chords += Config::ChordToString(cfg.passthroughKeys[i]);
+        const float rowW = std::min(150.0f * scale, std::max(1.0f, ImGui::GetContentRegionAvail().x));
+        int removeIdx = -1;
+        for (int i = 0; i < (int)cfg.passthroughKeys.size(); ++i) {
+            ImGui::PushID(i);
+            const bool capturingThis =
+                g_captureMode.load(std::memory_order_relaxed) == 1 &&
+                g_captureKind.load(std::memory_order_relaxed) == CAP_PASSTHROUGH &&
+                g_captureIndex.load(std::memory_order_relaxed) == i;
+            char label[96];
+            snprintf(label, sizeof(label), "[%s]", Config::ChordToString(cfg.passthroughKeys[i]).c_str());
+            if (capturingThis) {
+                theme::PushCapturingStyle();
+                ImGui::Button(i18n.T("capturing"), ImVec2(rowW, 0.0f));
+                theme::PopCapturingStyle();
+            } else if (ImGui::Button(label, ImVec2(rowW, 0.0f))) {
+                g_captureIndex.store(i, std::memory_order_relaxed);
+                g_captureKind.store(CAP_PASSTHROUGH, std::memory_order_relaxed);
+                g_captureMode.store(1, std::memory_order_relaxed);
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", i18n.T("passthrough_edit_tip"));
+            ImGui::SameLine();
+            if (ImGui::Button("x", ImVec2(24.0f * scale, 0.0f))) removeIdx = i;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", i18n.T("passthrough_del_tip"));
+            ImGui::PopID();
         }
-        ImGui::TextDisabled("%s: %s", i18n.T("passthrough"),
-                            chords.empty() ? "-" : chords.c_str());
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", i18n.T("passthrough_hint"));
+        if (removeIdx >= 0) {
+            cfg.passthroughKeys.erase(cfg.passthroughKeys.begin() + removeIdx);
+            ui.requestSave = true;
+            InputSetPassthrough(cfg.passthroughKeys, cfg.passthroughReplay);
+            Log("[ui] passthrough chord removed (remaining %d)", (int)cfg.passthroughKeys.size());
+        }
+        if ((int)cfg.passthroughKeys.size() < 8) {
+            if (ImGui::Button(i18n.T("passthrough_add"), ImVec2(rowW, 0.0f))) {
+                g_captureIndex.store(-1, std::memory_order_relaxed);
+                g_captureKind.store(CAP_PASSTHROUGH, std::memory_order_relaxed);
+                g_captureMode.store(1, std::memory_order_relaxed);
+            }
+        }
     }
 
     ImGui::Separator();
@@ -579,8 +617,15 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
     static bool selSettings = false;
     static std::set<std::string> expanded;
 
+    // Review H5: before drawing any page, drop callbacks whose mod DLL
+    // hot-unloaded. Pages keep their row but a cleared fn renders as empty
+    // content instead of jumping into unmapped code.
+    RegistryPurgeOrphanedCallbacks();
+
     // Hold the registry for the whole frame: registration from other threads
     // waits at most one frame; our own recursive calls stay legal.
+    // Review H3: api.cpp's ConfigAdd*/Get*/Set* take this same mutex, so a mod
+    // thread can never mutate ConfigDef::items while the frame walks them.
     std::lock_guard<std::recursive_mutex> lock(RegistryMutex());
     auto& sections = RegistrySections();
 
@@ -652,6 +697,9 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
         contentPage = selPage;
     }
     if (!contentNode) {
+        // L4: nothing is rendered from a schema here, so a rect left over from
+        // the previous page must not be reported as this page's item.
+        SchemaClearLastItemRect();
         // Nothing picked yet (or the picked node was removed): invite instead
         // of silently showing some mod's page.
         ImGui::TextDisabled("%s", i18n.T("select_hint"));
@@ -686,6 +734,9 @@ void DrawMenu(Config& cfg, I18n& i18n, MenuUi& ui, float dt) {
             RenderSchemaForm(*(ConfigDef*)pg.schemaCfg, i18n, dt);
         }
     }
+    // L4: custom-widget pages never record a rect; keep the previous page's
+    // rect from being reported while such a page is shown.
+    if (!currentSchema) SchemaClearLastItemRect();
     ImGui::EndChild();
 
     // Footer row, pinned to the panel's bottom-left corner: the framework

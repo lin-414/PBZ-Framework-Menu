@@ -59,7 +59,11 @@ void PopCapturingStyle();
 // automation depends on them). A missing or unparsable file keeps the
 // built-in style. Render thread only.
 void ApplyThemeByName(const std::string& nameUtf8);
-// "ink" first, then the sorted stems of ModRoot\themes\*.json.
-std::vector<std::string> ListThemeNames();
+// M4: the list is cached; rescan the themes directory only on demand (the
+// picker calls this when its popup opens, so a newly dropped theme file is
+// still picked up without scanning the disk on every frame).
+void RefreshThemeNames();
+// "ink" first, then the sorted stems of ModRoot\themes\*.json (cached).
+const std::vector<std::string>& ListThemeNames();
 
 } } // namespace pbzfm::theme
